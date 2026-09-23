@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import resource
+import signal
 import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from anki.collection import Collection
+from anki.errors import InvalidInput
 
 from anki_mcp.collection import AnkiCollectionService, ResourceLimitError
 
@@ -210,3 +213,69 @@ async def test_export_notes_csv_inlines_within_tiny_budget(
 
     assert "inline_omitted" not in result
     assert base64.b64decode(result["content_base64"]) == Path(result["path"]).read_bytes()
+
+
+@pytest.mark.anyio
+async def test_failed_export_leaves_no_artifact(tmp_path: Path) -> None:
+    path = str(tmp_path / "collection.anki2")
+    collection = Collection(path)
+    try:
+        model = collection.models.current()
+        deck = int(collection.decks.id("DeckA"))
+        note = collection.new_note(model)
+        note["Front"] = "x" * 5000
+        note["Back"] = "y" * 5000
+        collection.add_note(note, deck)
+    finally:
+        collection.close()
+
+    # Cap this process's file writes at 1 KiB. The note's CSV needs ~10 KiB, so the
+    # real exporter fails partway through writing its temp file.
+    exports_dir = Path(path).parent / "exports"
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        before = sorted(exports_dir.iterdir()) if exports_dir.exists() else []
+        previous_handler = signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_FSIZE)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (1024, hard_limit))
+        try:
+            with pytest.raises(InvalidInput):
+                await service.export_notes_csv(deck, True, True, True, False, False, False)
+        finally:
+            resource.setrlimit(resource.RLIMIT_FSIZE, (soft_limit, hard_limit))
+            signal.signal(signal.SIGXFSZ, previous_handler)
+
+    after = sorted(exports_dir.iterdir()) if exports_dir.exists() else []
+    assert after == before
+    assert not any(".tmp" in entry.name for entry in after)
+
+
+@pytest.fixture
+def reversed_card_collection(tmp_path: Path) -> Iterator[tuple[str, int]]:
+    path = str(tmp_path / "collection.anki2")
+    collection = Collection(path)
+    try:
+        model = collection.models.by_name("Basic (and reversed card)")
+        assert model is not None
+        deck = int(collection.decks.id("DeckR"))
+        note = collection.new_note(model)
+        note["Front"] = "front-r1"
+        note["Back"] = "back-r1"
+        collection.add_note(note, deck)
+        # Precondition: this notetype generates two cards for the single note.
+        assert len(collection.find_cards(f"did:{deck}")) == 2
+    finally:
+        collection.close()
+    yield path, deck
+
+
+@pytest.mark.anyio
+async def test_export_counts_notes_not_cards(
+    reversed_card_collection: tuple[str, int],
+) -> None:
+    path, deck = reversed_card_collection
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        apkg = await service.export_apkg(deck, False, True, False)
+        csv = await service.export_notes_csv(deck, True, True, True, False, False, False)
+
+    assert apkg["exported_notes"] == 1
+    assert csv["rows"] == 1
