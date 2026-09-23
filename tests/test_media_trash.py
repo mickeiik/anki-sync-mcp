@@ -280,3 +280,29 @@ async def test_preview_handles_non_utf8_trash_filename(tmp_path: Path) -> None:
         )
 
     assert preview["files"] == 1
+
+
+@pytest.mark.anyio
+async def test_symlink_entry_is_emptied_without_following_the_target(tmp_path: Path) -> None:
+    path = tmp_path / "collection.anki2"
+    collection = Collection(str(path))
+    try:
+        media_dir = Path(collection.media.dir())
+        media_dir.mkdir(parents=True, exist_ok=True)
+        (media_dir / "live.txt").write_bytes(b"live")
+    finally:
+        collection.close()
+    trash = tmp_path / "media.trash"
+    trash.mkdir()
+    (trash / "link.txt").symlink_to(media_dir / "live.txt")
+
+    async with AnkiCollectionService(str(path), max_page_size=100) as service:
+        preview = await service.executor.run(
+            lambda adapter: adapter.preview_media_empty_trash()
+        )
+        removed = await service.executor.run(lambda adapter: adapter.empty_media_trash())
+
+    assert preview["files"] == 1
+    assert removed == {"emptied": True, "files_removed": 1}
+    assert not (trash / "link.txt").exists() and not (trash / "link.txt").is_symlink()
+    assert (media_dir / "live.txt").read_bytes() == b"live"

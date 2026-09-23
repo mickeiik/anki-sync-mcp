@@ -2722,15 +2722,20 @@ class CollectionAdapter:
         if folder.exists() and not folder.is_dir():
             raise ValueError("media trash path is not a directory")
         if folder.is_dir():
-            for path in folder.iterdir():
-                if path.is_symlink() or not path.is_file():
-                    raise ValueError("media trash contains a non-regular file")
-                stat = path.stat()
-                entries.append((path.name, stat.st_size, stat.st_mtime_ns))
-                if len(entries) > self.max_search_scan:
-                    raise ValueError(
-                        "media trash exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
-                    )
+            try:
+                for path in folder.iterdir():
+                    # A real subdirectory cannot be emptied by the backend; symlink
+                    # entries are unlinked without following them, so allow those.
+                    if path.is_dir() and not path.is_symlink():
+                        raise ValueError("media trash contains a non-regular file")
+                    stat = path.lstat()
+                    entries.append((path.name, stat.st_size, stat.st_mtime_ns))
+                    if len(entries) > self.max_search_scan:
+                        raise ValueError(
+                            "media trash exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
+                        )
+            except OSError as exc:
+                raise ValueError(f"media trash could not be read: {exc}") from exc
         return entries
 
     def preview_media_empty_trash(self) -> dict[str, Any]:
@@ -2748,6 +2753,8 @@ class CollectionAdapter:
 
     def empty_media_trash(self) -> dict[str, Any]:
         files_removed = len(self._media_trash_entries())
+        if self._media_trash_folder().is_symlink():
+            raise ValueError("media.trash must not be a symbolic link")
         self.collection.media.empty_trash()
         return {"emptied": True, "files_removed": files_removed}
 
