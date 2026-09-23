@@ -64,6 +64,31 @@ async def test_deck_options_counts_reflect_due_tree(
 
 
 @pytest.mark.anyio
+async def test_deck_options_counts_empty_default_deck_absent_from_due_tree(
+    tmp_path: Path,
+) -> None:
+    path = str(tmp_path / "collection.anki2")
+    collection = Collection(path)
+    try:
+        collection.decks.id("Other")  # leaves the Default deck empty and childless
+    finally:
+        collection.close()
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        result = await service.get_deck_options(1, include_sections=("counts",))
+
+    assert result["sections"]["counts"] == {
+        "new": 0,
+        "review": 0,
+        "learning": 0,
+        "new_uncapped": 0,
+        "review_uncapped": 0,
+        "total_in_deck": 0,
+        "total_including_children": 0,
+    }
+
+
+@pytest.mark.anyio
 async def test_deck_options_are_compact_by_default_and_expand_requested_sections(
     deck_options_collection: tuple[str, int, int],
 ) -> None:

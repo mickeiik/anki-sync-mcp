@@ -28,7 +28,7 @@ from anki._backend import RustBackend
 from anki.collection import AddNoteRequest, Collection, DeckIdLimit
 from anki.config_pb2 import ConfigKey
 from anki.consts import CARD_TYPE_REV, QUEUE_TYPE_SUSPENDED
-from anki.decks import UpdateDeckConfigs
+from anki.decks import DeckTreeNode, UpdateDeckConfigs
 from anki.errors import (
     BackendError,
     InvalidInput,
@@ -1854,11 +1854,10 @@ class CollectionAdapter:
                 "limit_chain": parent_chain,
             }
         if "counts" in requested:
+            # Anki omits an empty, childless Default deck from the due tree; report zeros.
             node = self.collection.decks.find_deck_in_tree(
                 self.collection.sched.deck_due_tree(), cast("DeckId", deck_id)
-            )
-            if node is None:  # pragma: no cover - a fetched deck is present in the tree
-                raise RuntimeError("deck was not present in Anki's deck tree")
+            ) or DeckTreeNode()
             sections["counts"] = {
                 "new": int(node.new_count),
                 "review": int(node.review_count),
