@@ -14,7 +14,7 @@ from anki.collection import Collection
 from starlette.testclient import TestClient
 
 from anki_mcp.app import create_app
-from anki_mcp.collection import AnkiCollectionService, ResourceLimitError
+from anki_mcp.collection import AnkiCollectionService, ImportFileError, ResourceLimitError
 from anki_mcp.config import Settings
 
 
@@ -750,3 +750,43 @@ def test_app_apkg_predictable_file_failure_is_invalid_argument(
         assert "DESTRUCTIVE_CONFIRMATION_REQUIRED" in replay["content"][0]["text"]
 
     assert Collection(str(target)).note_count() == 0
+
+
+def _craft_unsupported_method_apkg(path: Path) -> None:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("meta", b"{}")
+        archive.writestr("collection.anki2", b"collection-bytes")
+    raw = bytearray(buffer.getvalue())
+    raw[8:10] = (99).to_bytes(2, "little")  # local header: unsupported method
+    central = raw.find(b"PK\x01\x02")
+    assert central > 0
+    raw[central + 10 : central + 12] = (99).to_bytes(2, "little")
+    path.write_bytes(bytes(raw))
+
+
+def test_apkg_with_unsupported_compression_is_a_clean_file_error(tmp_path: Path) -> None:
+    path = tmp_path / "collection.anki2"
+    Collection(str(path)).close()
+    _craft_unsupported_method_apkg(_imports_dir(path) / "crafted.apkg")
+
+    async def scenario() -> None:
+        async with AnkiCollectionService(path, max_page_size=100) as service:
+            with pytest.raises(ImportFileError):
+                await service.coordinated_read(
+                    lambda adapter: adapter.preview_import_apkg_file("crafted.apkg")
+                )
+            with pytest.raises(ImportFileError):
+                await service.coordinated_mutation(
+                    "anki_import_apkg",
+                    "crafted-key",
+                    {"filename": "crafted.apkg"},
+                    lambda adapter: adapter.import_apkg(
+                        "crafted.apkg", False, 2, 2, True, False
+                    ),
+                )
+            # A predictable file failure deletes its receipt, so the replay re-executes.
+            with pytest.raises(LookupError):
+                await service.get_operation("crafted-key")
+
+    asyncio.run(scenario())

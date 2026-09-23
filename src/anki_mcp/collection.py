@@ -12,6 +12,7 @@ import os
 import shutil
 import threading
 import time
+import zlib
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -172,6 +173,16 @@ class ResourceLimitError(ValueError):
 
 class ImportFileError(ValueError):
     """Raised when a staged import file cannot be read or validated as expected."""
+
+
+IMPORT_FILE_FAILURES = (
+    BackendError,
+    OSError,
+    UnicodeDecodeError,
+    NotImplementedError,
+    RuntimeError,
+    zlib.error,
+)
 
 
 class MediaSyncFailedError(TimeoutError):
@@ -3533,7 +3544,7 @@ class CollectionAdapter:
                 digest = hashlib.file_digest(handle, "sha256").hexdigest()
         except BadZipFile as exc:
             raise ValueError("import package is not a valid zip archive") from exc
-        except (BackendError, OSError, UnicodeDecodeError) as exc:
+        except IMPORT_FILE_FAILURES as exc:
             raise ImportFileError(f"staged import file could not be read: {exc}") from exc
         return {
             "filename": filename,
@@ -3567,7 +3578,7 @@ class CollectionAdapter:
                     ),
                 )
             )
-        except (BackendError, OSError, UnicodeDecodeError) as exc:
+        except IMPORT_FILE_FAILURES as exc:
             raise ImportFileError(f"staged import file could not be read: {exc}") from exc
         log = response.log
         return {
@@ -3627,7 +3638,7 @@ class CollectionAdapter:
             with path.open("rb") as handle:
                 digest = hashlib.file_digest(handle, "sha256").hexdigest()
             sample_rows = self._csv_sample_rows(path, effective)
-        except (BackendError, OSError, UnicodeDecodeError) as exc:
+        except IMPORT_FILE_FAILURES as exc:
             raise ImportFileError(f"staged import file could not be read: {exc}") from exc
         return {
             "filename": filename,
@@ -3706,7 +3717,7 @@ class CollectionAdapter:
             response = self.collection.import_csv(
                 ImportCsvRequest(path=str(path), metadata=metadata)
             )
-        except (BackendError, OSError, UnicodeDecodeError) as exc:
+        except IMPORT_FILE_FAILURES as exc:
             raise ImportFileError(f"staged import file could not be read: {exc}") from exc
         log = response.log
         return {
