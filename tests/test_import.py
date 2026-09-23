@@ -1,0 +1,519 @@
+from __future__ import annotations
+
+import asyncio
+import io
+import json
+import os
+import shutil
+import zipfile
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+from anki.collection import Collection
+from starlette.testclient import TestClient
+
+from anki_mcp.app import create_app
+from anki_mcp.collection import AnkiCollectionService, ResourceLimitError
+from anki_mcp.config import Settings
+
+
+def _create_source(path: Path, deck_name: str = "Deck A") -> int:
+    """Create a small collection with two Basic notes; return the deck ID."""
+    collection = Collection(str(path))
+    try:
+        model = collection.models.current()
+        deck_id = int(collection.decks.id(deck_name))
+        for front, back in (("front-a1", "back-a1"), ("front-a2", "back-a2")):
+            note = collection.new_note(model)
+            note["Front"] = front
+            note["Back"] = back
+            collection.add_note(note, deck_id)
+    finally:
+        collection.close()
+    return deck_id
+
+
+def _empty_collection(path: Path) -> None:
+    collection = Collection(str(path))
+    collection.close()
+
+
+def _imports_dir(path: str | Path) -> Path:
+    folder = Path(path).parent / "imports"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+async def _export_fixtures(path: str, deck_id: int) -> tuple[dict, dict]:
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        apkg = await service.export_apkg(deck_id, False, True, False)
+        csv = await service.export_notes_csv(deck_id, True, True, False, False, False, False)
+    return apkg, csv
+
+
+@pytest.fixture
+def source_collection(tmp_path: Path) -> Iterator[tuple[str, int]]:
+    source = tmp_path / "source" / "collection.anki2"
+    source.parent.mkdir(parents=True)
+    deck_id = _create_source(source)
+    yield str(source), deck_id
+
+
+# --------------------------------------------------------------------------------------
+# list / path validation / size cap
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_list_import_files_orders_newest_first(tmp_path: Path) -> None:
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+    imports = _imports_dir(target)
+    (imports / "old.csv").write_text("a,b\n")
+    (imports / "new.apkg").write_bytes(b"x")
+    (imports / "skip.txt").write_text("ignore me")
+    os.utime(imports / "old.csv", (1_000_000, 1_000_000))
+    os.utime(imports / "new.apkg", (2_000_000, 2_000_000))
+
+    async with AnkiCollectionService(str(target), max_page_size=100) as service:
+        page = await service.list_import_files(0, 10)
+
+    assert [item["filename"] for item in page["items"]] == ["new.apkg", "old.csv"]
+    assert page["total"] == 2
+    assert all("size_bytes" in item and "mtime" in item for item in page["items"])
+
+
+@pytest.mark.anyio
+async def test_import_path_validation(tmp_path: Path) -> None:
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+    imports = _imports_dir(target)
+    (imports / "good.apkg").write_bytes(b"x")
+    (imports / "wrong.txt").write_bytes(b"x")
+    outside = tmp_path / "outside.apkg"
+    outside.write_bytes(b"x")
+    (imports / "link.apkg").symlink_to(outside)
+
+    async with AnkiCollectionService(str(target), max_page_size=100) as service:
+        with pytest.raises(LookupError, match="not found"):
+            await service.preview_import_apkg("missing.apkg")
+        with pytest.raises(ValueError, match="plain filename"):
+            await service.preview_import_apkg("../outside.apkg")
+        with pytest.raises(ValueError, match="plain filename"):
+            await service.preview_import_apkg("sub/good.apkg")
+        with pytest.raises(ValueError, match="plain filename"):
+            await service.preview_import_apkg("sub\\good.apkg")
+        with pytest.raises(ValueError, match=r"\.apkg or \.csv"):
+            await service.preview_import_apkg("wrong.txt")
+        with pytest.raises(ValueError, match="symbolic link"):
+            await service.preview_import_apkg("link.apkg")
+        with pytest.raises(ValueError, match=r"\.csv file"):
+            await service.preview_import_csv("good.apkg", None)
+
+
+@pytest.mark.anyio
+async def test_import_size_cap(tmp_path: Path) -> None:
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+    imports = _imports_dir(target)
+    (imports / "big.csv").write_text("f,b\n" + ("x" * 500) + "\n")
+
+    async with AnkiCollectionService(
+        str(target), max_page_size=100, max_import_bytes=64
+    ) as service:
+        with pytest.raises(ResourceLimitError, match="ANKI_MAX_IMPORT_BYTES"):
+            await service.preview_import_csv("big.csv", None)
+
+
+@pytest.mark.anyio
+async def test_preview_apkg_rejects_corrupt_and_missing_members(tmp_path: Path) -> None:
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+    imports = _imports_dir(target)
+    (imports / "corrupt.apkg").write_bytes(b"not a zip")
+    with zipfile.ZipFile(imports / "missing.apkg", "w") as archive:
+        archive.writestr("hello.txt", "hi")
+    # A structurally valid zip whose member data was altered: namelist still works,
+    # but the CRC integrity check must reject it.
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("meta", "{}")
+        archive.writestr("collection.anki2", b"collection-bytes")
+    raw = bytearray(buffer.getvalue())
+    raw[raw.find(b"collection-bytes")] ^= 0xFF
+    (imports / "tampered.apkg").write_bytes(bytes(raw))
+
+    async with AnkiCollectionService(str(target), max_page_size=100) as service:
+        with pytest.raises(ValueError, match="valid zip archive"):
+            await service.preview_import_apkg("corrupt.apkg")
+        with pytest.raises(ValueError, match="missing required collection members"):
+            await service.preview_import_apkg("missing.apkg")
+        with pytest.raises(ValueError, match="integrity check"):
+            await service.preview_import_apkg("tampered.apkg")
+
+
+# --------------------------------------------------------------------------------------
+# round trips
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_apkg_round_trip(source_collection: tuple[str, int], tmp_path: Path) -> None:
+    source, deck_id = source_collection
+    apkg, _ = await _export_fixtures(source, deck_id)
+
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+    imports = _imports_dir(target)
+    shutil.copy2(apkg["path"], imports / "fixture.apkg")
+
+    async with AnkiCollectionService(str(target), max_page_size=100) as service:
+        preview = await service.preview_import_apkg("fixture.apkg")
+        assert preview["validated"] is True
+        assert preview["sha256"] == apkg["sha256"]
+
+        result = await service.import_apkg("fixture.apkg", True, 2, 2, True, False)
+        searched = await service.search_notes("", 0, 100)
+
+    assert result["notes_added"] == 2
+    assert result["notes_found"] == 2
+    assert {note["first_field"] for note in searched["items"]} == {"front-a1", "front-a2"}
+
+
+@pytest.mark.anyio
+async def test_csv_round_trip(source_collection: tuple[str, int], tmp_path: Path) -> None:
+    source, deck_id = source_collection
+    _, csv = await _export_fixtures(source, deck_id)
+
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+    imports = _imports_dir(target)
+    shutil.copy2(csv["path"], imports / "fixture.csv")
+
+    collection = Collection(str(target))
+    try:
+        notetype_id = int(collection.models.by_name("Basic")["id"])
+        deck = int(collection.decks.id("Imported"))
+    finally:
+        collection.close()
+
+    async with AnkiCollectionService(str(target), max_page_size=100) as service:
+        preview = await service.preview_import_csv("fixture.csv", "\t")
+        assert preview["delimiter"] == "\t"
+        assert preview["is_html"] is True
+        assert preview["sample_rows"][0][:2] == ["front-a1", "back-a1"]
+
+        result = await service.import_csv(
+            "fixture.csv", notetype_id, [1, 2], deck, "\t", True, [], "preserve"
+        )
+        searched = await service.search_notes("", 0, 100)
+        cards = await service.search_cards("", 0, 100)
+
+    assert result["notes_added"] == 2
+    assert result["notes_found"] == 2
+    assert {note["first_field"] for note in searched["items"]} == {
+        "front-a1",
+        "front-a2",
+    }
+    assert cards["total"] == 2
+
+
+@pytest.mark.anyio
+async def test_csv_field_columns_must_map_every_field(
+    source_collection: tuple[str, int], tmp_path: Path
+) -> None:
+    source, deck_id = source_collection
+    _, csv = await _export_fixtures(source, deck_id)
+
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+    imports = _imports_dir(target)
+    shutil.copy2(csv["path"], imports / "fixture.csv")
+
+    collection = Collection(str(target))
+    try:
+        notetype_id = int(collection.models.by_name("Basic")["id"])
+    finally:
+        collection.close()
+
+    async with AnkiCollectionService(str(target), max_page_size=100) as service:
+        with pytest.raises(ValueError, match="field_columns must map every field"):
+            await service.import_csv(
+                "fixture.csv", notetype_id, [1], 1, "\t", True, [], "preserve"
+            )
+        with pytest.raises(ValueError, match="dupe_resolution"):
+            await service.import_csv(
+                "fixture.csv", notetype_id, [1, 2], 1, "\t", True, [], "bogus"
+            )
+
+
+# --------------------------------------------------------------------------------------
+# gates
+# --------------------------------------------------------------------------------------
+
+
+def _tool_names(
+    path: Path,
+    *,
+    allow_import: bool,
+    scopes: str = "read,write,admin,destructive",
+    allow_schema: bool = False,
+    allow_full_sync: bool = False,
+) -> list[str]:
+    settings = Settings(
+        _env_file=None,
+        MCP_AUTH_TOKEN="test-token",
+        ANKI_COLLECTION_PATH=str(path),
+        MCP_SCOPES=scopes,
+        ANKI_SYNC_ON_WRITE=False,
+        ANKI_ALLOW_IMPORT=allow_import,
+        ANKI_ALLOW_SCHEMA_CHANGES=allow_schema,
+        ANKI_ALLOW_FULL_SYNC=allow_full_sync,
+    )
+    headers = {
+        "Authorization": "Bearer test-token",
+        "Accept": "application/json, text/event-stream",
+    }
+    with TestClient(create_app(settings)) as client:
+        initialized = client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "pytest", "version": "1"},
+                },
+            },
+        )
+        headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+        listed = client.post(
+            "/mcp",
+            headers=headers,
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        )
+    return [tool["name"] for tool in listed.json()["result"]["tools"]]
+
+
+def test_import_tools_require_flags_and_destructive_scope(tmp_path: Path) -> None:
+    path = tmp_path / "collection.anki2"
+    Collection(str(path)).close()
+    gated = {
+        "anki_import_apkg_preview",
+        "anki_import_apkg",
+        "anki_import_csv_preview",
+        "anki_import_csv",
+    }
+
+    disabled = _tool_names(path, allow_import=False)
+    assert "anki_import_files_list" in disabled
+    assert not (gated & set(disabled))
+
+    csv_only = _tool_names(path, allow_import=True)
+    assert {"anki_import_csv_preview", "anki_import_csv"} <= set(csv_only)
+    assert not ({"anki_import_apkg_preview", "anki_import_apkg"} & set(csv_only))
+
+    full = _tool_names(path, allow_import=True, allow_schema=True, allow_full_sync=True)
+    assert gated <= set(full)
+
+    no_scope = _tool_names(path, allow_import=True, scopes="read,write,admin")
+    assert "anki_import_files_list" in no_scope
+    assert not (gated & set(no_scope))
+
+
+# --------------------------------------------------------------------------------------
+# app-level token flow, idempotency, backups
+# --------------------------------------------------------------------------------------
+
+
+def _call(
+    client: TestClient, headers: dict[str, str], request_id: int, name: str, arguments: dict
+) -> dict:
+    response = client.post(
+        "/mcp",
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        },
+    )
+    return response.json()["result"]
+
+
+def _payload(result: dict) -> dict:
+    assert result.get("isError") is not True, result
+    return json.loads(result["content"][0]["text"])
+
+
+def _import_settings(path: Path, monkeypatch: pytest.MonkeyPatch) -> Settings:
+    monkeypatch.setenv("MCP_AUTH_TOKEN", "import-token")
+    monkeypatch.setenv("ANKI_COLLECTION_PATH", str(path))
+    monkeypatch.setenv("ANKI_SYNC_ON_WRITE", "false")
+    monkeypatch.setenv("MCP_SCOPES", "read,write,admin,destructive")
+    monkeypatch.setenv("ANKI_ALLOW_DESTRUCTIVE", "true")
+    monkeypatch.setenv("ANKI_ALLOW_SCHEMA_CHANGES", "true")
+    monkeypatch.setenv("ANKI_ALLOW_FULL_SYNC", "true")
+    monkeypatch.setenv("ANKI_ALLOW_IMPORT", "true")
+    return Settings(_env_file=None)
+
+
+_HEADERS = {
+    "Authorization": "Bearer import-token",
+    "Accept": "application/json, text/event-stream",
+}
+
+
+def _initialize(client: TestClient) -> dict[str, str]:
+    headers = dict(_HEADERS)
+    initialized = client.post(
+        "/mcp",
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "pytest", "version": "1"},
+            },
+        },
+    )
+    headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+    return headers
+
+
+def test_app_apkg_import_token_flow_replay_and_backup(
+    source_collection: tuple[str, int], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, deck_id = source_collection
+    apkg, _ = asyncio.run(_export_fixtures(source, deck_id))
+
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+    shutil.copy2(apkg["path"], _imports_dir(target) / "fixture.apkg")
+
+    settings = _import_settings(target, monkeypatch)
+    with TestClient(create_app(settings)) as client:
+        headers = _initialize(client)
+
+        wrong = _call(
+            client,
+            headers,
+            2,
+            "anki_import_apkg",
+            {
+                "filename": "fixture.apkg",
+                "confirmation_token": "bogus",
+                "idempotency_key": "apkg-1",
+            },
+        )
+        assert "DESTRUCTIVE_CONFIRMATION_REQUIRED" in wrong["content"][0]["text"]
+
+        preview = _payload(
+            _call(client, headers, 3, "anki_import_apkg_preview", {"filename": "fixture.apkg"})
+        )
+        arguments = {
+            "filename": "fixture.apkg",
+            "confirmation_token": preview["confirmation_token"],
+            "idempotency_key": "apkg-1",
+        }
+        applied = _payload(_call(client, headers, 4, "anki_import_apkg", arguments))
+        assert applied["state"] == "committed"
+        assert applied["result"]["notes_added"] == 2
+        assert Path(applied["result"]["backup"]["path"]).is_file()
+
+        replayed = _payload(_call(client, headers, 5, "anki_import_apkg", arguments))
+        assert replayed == applied
+
+        # A retry after the token was consumed must re-preview and still replay the
+        # stored receipt instead of conflicting on the changed token.
+        fresh_preview = _payload(
+            _call(client, headers, 6, "anki_import_apkg_preview", {"filename": "fixture.apkg"})
+        )
+        replayed_with_fresh_token = _payload(
+            _call(
+                client,
+                headers,
+                7,
+                "anki_import_apkg",
+                {
+                    "filename": "fixture.apkg",
+                    "confirmation_token": fresh_preview["confirmation_token"],
+                    "idempotency_key": "apkg-1",
+                },
+            )
+        )
+        assert replayed_with_fresh_token == applied
+
+        listed = _payload(_call(client, headers, 8, "anki_notes_search", {"query": ""}))
+        assert listed["total"] == 2
+
+    collection = Collection(str(target))
+    try:
+        assert collection.note_count() == 2
+    finally:
+        collection.close()
+
+
+def test_app_csv_import_token_flow_replay_and_backup(
+    source_collection: tuple[str, int], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, deck_id = source_collection
+    _, csv = asyncio.run(_export_fixtures(source, deck_id))
+
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+    shutil.copy2(csv["path"], _imports_dir(target) / "fixture.csv")
+
+    collection = Collection(str(target))
+    try:
+        notetype_id = int(collection.models.by_name("Basic")["id"])
+    finally:
+        collection.close()
+
+    settings = _import_settings(target, monkeypatch)
+    with TestClient(create_app(settings)) as client:
+        headers = _initialize(client)
+
+        preview = _payload(
+            _call(client, headers, 2, "anki_import_csv_preview", {"filename": "fixture.csv"})
+        )
+        assert preview["impact"]["delimiter"] == "\t"
+
+        arguments = {
+            "filename": "fixture.csv",
+            "notetype_id": notetype_id,
+            "field_columns": [1, 2],
+            "deck_id": 1,
+            "confirmation_token": preview["confirmation_token"],
+            "idempotency_key": "csv-1",
+        }
+        applied = _payload(_call(client, headers, 3, "anki_import_csv", arguments))
+        assert applied["state"] == "committed"
+        assert applied["result"]["notes_added"] == 2
+        assert Path(applied["result"]["backup"]["path"]).is_file()
+
+        replayed = _payload(_call(client, headers, 4, "anki_import_csv", arguments))
+        assert replayed == applied
+
+    collection = Collection(str(target))
+    try:
+        assert collection.note_count() == 2
+    finally:
+        collection.close()

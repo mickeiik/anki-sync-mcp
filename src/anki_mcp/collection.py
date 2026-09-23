@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import csv
 import hashlib
 import json
 import logging
@@ -19,7 +20,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 from uuid import uuid4
-from zipfile import ZipFile
+from zipfile import BadZipFile, ZipFile
 
 import anki.lang
 from anki._backend import RustBackend
@@ -28,7 +29,14 @@ from anki.config_pb2 import ConfigKey
 from anki.consts import CARD_TYPE_REV, QUEUE_TYPE_SUSPENDED
 from anki.decks import UpdateDeckConfigs
 from anki.errors import InvalidInput, NetworkError, NotFoundError, SearchError, UndoEmpty
-from anki.import_export_pb2 import ExportAnkiPackageOptions
+from anki.import_export_pb2 import (
+    CsvMetadata,
+    ExportAnkiPackageOptions,
+    ImportAnkiPackageOptions,
+    ImportAnkiPackageRequest,
+    ImportAnkiPackageUpdateCondition,
+    ImportCsvRequest,
+)
 from anki.media import media_paths_from_col_path
 from anki.scheduler_pb2 import SimulateFsrsReviewRequest
 from anki.sync import SyncAuth
@@ -53,6 +61,34 @@ SYNC_REQUIRED_NAMES = (
     "FULL_DOWNLOAD",
     "FULL_UPLOAD",
 )
+IMPORT_SUFFIXES = (".apkg", ".csv")
+CSV_DELIMITER_CHARS: dict[str, CsvMetadata.Delimiter.ValueType] = {
+    "\t": CsvMetadata.Delimiter.TAB,
+    "|": CsvMetadata.Delimiter.PIPE,
+    ";": CsvMetadata.Delimiter.SEMICOLON,
+    ":": CsvMetadata.Delimiter.COLON,
+    ",": CsvMetadata.Delimiter.COMMA,
+    " ": CsvMetadata.Delimiter.SPACE,
+}
+CSV_DELIMITER_NAMES: dict[int, str] = {
+    value: char for char, value in CSV_DELIMITER_CHARS.items()
+}
+CSV_DUPE_RESOLUTIONS: dict[str, CsvMetadata.DupeResolution.ValueType] = {
+    "preserve": CsvMetadata.DupeResolution.PRESERVE,
+    "update": CsvMetadata.DupeResolution.UPDATE,
+    "duplicate": CsvMetadata.DupeResolution.DUPLICATE,
+}
+UPDATE_CONDITIONS: dict[str, ImportAnkiPackageUpdateCondition.ValueType] = {
+    "ALWAYS": ImportAnkiPackageUpdateCondition.Value(
+        "IMPORT_ANKI_PACKAGE_UPDATE_CONDITION_ALWAYS"
+    ),
+    "IF_NEWER": ImportAnkiPackageUpdateCondition.Value(
+        "IMPORT_ANKI_PACKAGE_UPDATE_CONDITION_IF_NEWER"
+    ),
+    "NEVER": ImportAnkiPackageUpdateCondition.Value(
+        "IMPORT_ANKI_PACKAGE_UPDATE_CONDITION_NEVER"
+    ),
+}
 UNDO_HISTORY_NOTE = (
     "Undo/redo history is held in memory for the running collection process; it is cleared by "
     "successful synchronization and is not durable across restarts or full downloads."
@@ -155,6 +191,7 @@ class CollectionAdapter:
         sync_on_read: bool = False,
         sync_on_write: bool = False,
         max_response_bytes: int = 1_048_576,
+        max_import_bytes: int = 268_435_456,
     ) -> None:
         if anki.lang.current_i18n is None:
             anki.lang.set_lang("en_US")
@@ -169,8 +206,11 @@ class CollectionAdapter:
         self.sync_on_read = sync_on_read
         self.sync_on_write = sync_on_write
         self.max_response_bytes = max_response_bytes
+        self.max_import_bytes = max_import_bytes
         self._backup_folder = Path(path).parent / "backups"
         self._exports_folder = Path(path).parent / "exports"
+        self._imports_folder = Path(path).parent / "imports"
+        self._imports_folder.mkdir(parents=True, exist_ok=True)
         self._state = PersistentState(path)
         persisted_auth = self._state.load_sync_auth()
         self._sync_auth = (
@@ -3416,6 +3456,207 @@ class CollectionAdapter:
                     result["inline_reason"] = "inline payload would exceed MCP_MAX_RESPONSE_BYTES"
         return result
 
+    def _import_path(self, filename: str, *, require_exists: bool) -> Path:
+        if (
+            "\x00" in filename
+            or not filename.strip()
+            or Path(filename).name != filename
+            or any(separator in filename for separator in ("/", "\\"))
+        ):
+            raise ValueError("import filename must be a plain filename without path separators")
+        if not filename.endswith(IMPORT_SUFFIXES):
+            raise ValueError("import filename must end with .apkg or .csv")
+        path = self._imports_folder / filename
+        if path.is_symlink():
+            raise ValueError("import filename must not reference a symbolic link")
+        if path.resolve().parent != self._imports_folder.resolve():
+            raise ValueError("import filename must resolve inside the imports folder")
+        if require_exists and not path.is_file():
+            raise LookupError(f"import {filename} not found")
+        if path.is_file() and path.stat().st_size > self.max_import_bytes:
+            raise ResourceLimitError(
+                f"import {filename} exceeds ANKI_MAX_IMPORT_BYTES ({self.max_import_bytes})"
+            )
+        return path
+
+    def list_import_files(self, offset: int, limit: int) -> dict[str, Any]:
+        items: list[dict[str, Any]] = []
+        if self._imports_folder.is_dir():
+            for path in self._imports_folder.iterdir():
+                if path.is_file() and not path.is_symlink() and path.suffix in IMPORT_SUFFIXES:
+                    stat = path.stat()
+                    items.append(
+                        {
+                            "filename": path.name,
+                            "size_bytes": stat.st_size,
+                            "mtime": stat.st_mtime,
+                        }
+                    )
+        items.sort(key=lambda item: item["mtime"], reverse=True)
+        return self._page(items, offset, limit)
+
+    def preview_import_apkg_file(self, filename: str) -> dict[str, Any]:
+        path = self._import_path(filename, require_exists=True)
+        if path.suffix != ".apkg":
+            raise ValueError("apkg import requires a .apkg file")
+        try:
+            with ZipFile(path) as archive:
+                members = set(archive.namelist())
+                if archive.testzip() is not None:
+                    raise ValueError("import package failed its integrity check")
+        except BadZipFile as exc:
+            raise ValueError("import package is not a valid zip archive") from exc
+        if "meta" not in members or not members & {"collection.anki21b", "collection.anki2"}:
+            raise ValueError("import package is missing required collection members")
+        stat = path.stat()
+        with path.open("rb") as handle:
+            digest = hashlib.file_digest(handle, "sha256").hexdigest()
+        return {
+            "filename": filename,
+            "size_bytes": stat.st_size,
+            "sha256": digest,
+            "validated": True,
+        }
+
+    def import_apkg(
+        self,
+        filename: str,
+        merge_notetypes: bool,
+        update_notes: ImportAnkiPackageUpdateCondition.ValueType,
+        update_notetypes: ImportAnkiPackageUpdateCondition.ValueType,
+        with_scheduling: bool,
+        with_deck_configs: bool,
+    ) -> dict[str, Any]:
+        path = self._import_path(filename, require_exists=True)
+        # Re-validate the archive so a file swapped after preview cannot be imported.
+        self.preview_import_apkg_file(filename)
+        response = self.collection.import_anki_package(
+            ImportAnkiPackageRequest(
+                package_path=str(path),
+                options=ImportAnkiPackageOptions(
+                    merge_notetypes=merge_notetypes,
+                    update_notes=update_notes,
+                    update_notetypes=update_notetypes,
+                    with_scheduling=with_scheduling,
+                    with_deck_configs=with_deck_configs,
+                ),
+            )
+        )
+        log = response.log
+        return {
+            "filename": filename,
+            "notes_added": len(log.new),
+            "notes_updated": len(log.updated),
+            "notes_duplicate": len(log.duplicate),
+            "notes_conflicting": len(log.conflicting),
+            "notes_found": int(log.found_notes),
+            "merge_notetypes": merge_notetypes,
+            "update_notes": update_notes,
+            "update_notetypes": update_notetypes,
+            "with_scheduling": with_scheduling,
+            "with_deck_configs": with_deck_configs,
+        }
+
+    @staticmethod
+    def _csv_delimiter(delimiter: str | None) -> CsvMetadata.Delimiter.ValueType | None:
+        if delimiter is None:
+            return None
+        value = CSV_DELIMITER_CHARS.get(delimiter)
+        if value is None:
+            raise ValueError("delimiter must be one of tab, |, ;, :, comma, or space")
+        return value
+
+    def _csv_sample_rows(
+        self, path: Path, delimiter_char: str, *, max_rows: int = 5, max_bytes: int = 4096
+    ) -> list[list[str]]:
+        with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+            content = handle.read(max_bytes)
+        lines = [
+            line for line in content.splitlines() if line.strip() and not line.startswith("#")
+        ]
+        if len(content) >= max_bytes and content and not content.endswith("\n"):
+            lines = lines[:-1]
+        sample: list[list[str]] = []
+        for row in csv.reader(lines, delimiter=delimiter_char):
+            sample.append([cell[:256] for cell in row])
+            if len(sample) >= max_rows:
+                break
+        return sample
+
+    def preview_import_csv(self, filename: str, delimiter: str | None) -> dict[str, Any]:
+        path = self._import_path(filename, require_exists=True)
+        if path.suffix != ".csv":
+            raise ValueError("csv import requires a .csv file")
+        delimiter_value = self._csv_delimiter(delimiter)
+        metadata = self.collection.get_csv_metadata(str(path), delimiter_value)
+        effective = (
+            delimiter
+            if delimiter is not None
+            else CSV_DELIMITER_NAMES.get(int(metadata.delimiter), "\t")
+        )
+        return {
+            "filename": filename,
+            "size_bytes": path.stat().st_size,
+            "delimiter": effective,
+            "is_html": bool(metadata.is_html),
+            "column_labels": list(metadata.column_labels),
+            "sample_rows": self._csv_sample_rows(path, effective),
+        }
+
+    def import_csv(
+        self,
+        filename: str,
+        notetype_id: int,
+        field_columns: Sequence[int],
+        deck_id: int,
+        delimiter: str | None,
+        is_html: bool | None,
+        tags: Sequence[str],
+        dupe_resolution: str,
+    ) -> dict[str, Any]:
+        path = self._import_path(filename, require_exists=True)
+        if path.suffix != ".csv":
+            raise ValueError("csv import requires a .csv file")
+        model = self.collection.models.get(cast("NotetypeId", notetype_id))
+        if model is None:
+            raise LookupError(f"note type {notetype_id} not found")
+        field_count = len(model["flds"])
+        if len(field_columns) != field_count:
+            raise ValueError(
+                f"field_columns must map every field of note type {notetype_id} "
+                f"({field_count} fields, got {len(field_columns)})"
+            )
+        self.get_deck(deck_id)
+        try:
+            dupe_value = CSV_DUPE_RESOLUTIONS[dupe_resolution]
+        except KeyError as exc:
+            raise ValueError("dupe_resolution must be preserve, update, or duplicate") from exc
+        delimiter_value = self._csv_delimiter(delimiter)
+        metadata = self.collection.get_csv_metadata(str(path), delimiter_value)
+        if delimiter_value is not None:
+            metadata.delimiter = delimiter_value
+        metadata.global_notetype.id = notetype_id
+        del metadata.global_notetype.field_columns[:]
+        metadata.global_notetype.field_columns.extend(field_columns)
+        metadata.deck_id = deck_id
+        if is_html is not None:
+            metadata.is_html = is_html
+        del metadata.global_tags[:]
+        metadata.global_tags.extend(tags)
+        metadata.dupe_resolution = dupe_value
+        response = self.collection.import_csv(ImportCsvRequest(path=str(path), metadata=metadata))
+        log = response.log
+        return {
+            "filename": filename,
+            "notetype_id": notetype_id,
+            "deck_id": deck_id,
+            "notes_added": len(log.new),
+            "notes_updated": len(log.updated),
+            "notes_duplicate": len(log.duplicate),
+            "notes_conflicting": len(log.conflicting),
+            "notes_found": int(log.found_notes),
+        }
+
     def undo_status(self) -> dict[str, Any]:
         status = self.collection.undo_status()
         return {
@@ -3472,6 +3713,7 @@ class CollectionExecutor:
         sync_on_read: bool = False,
         sync_on_write: bool = False,
         max_response_bytes: int = 1_048_576,
+        max_import_bytes: int = 268_435_456,
     ) -> None:
         self._path = path
         self._max_page_size = max_page_size
@@ -3484,6 +3726,7 @@ class CollectionExecutor:
         self._sync_on_read = sync_on_read
         self._sync_on_write = sync_on_write
         self._max_response_bytes = max_response_bytes
+        self._max_import_bytes = max_import_bytes
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="anki-collection")
         self._adapter: CollectionAdapter | None = None
         self._worker_id: int | None = None
@@ -3508,6 +3751,7 @@ class CollectionExecutor:
                 self._sync_on_read,
                 self._sync_on_write,
                 self._max_response_bytes,
+                self._max_import_bytes,
             )
 
         self._pool.submit(open_collection).result()
@@ -3548,6 +3792,7 @@ class AnkiCollectionService:
         sync_on_read: bool = False,
         sync_on_write: bool = False,
         max_response_bytes: int = 1_048_576,
+        max_import_bytes: int = 268_435_456,
     ) -> None:
         self.executor = CollectionExecutor(
             path,
@@ -3561,6 +3806,7 @@ class AnkiCollectionService:
             sync_on_read,
             sync_on_write,
             max_response_bytes,
+            max_import_bytes,
         )
 
     async def __aenter__(self) -> AnkiCollectionService:
@@ -3869,6 +4115,63 @@ class AnkiCollectionService:
         return await self.executor.run(
             lambda adapter: adapter.export_notes_csv(
                 deck_id, with_html, with_tags, with_deck, with_notetype, with_guid, inline
+            )
+        )
+
+    async def list_import_files(self, offset: int, limit: int) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.list_import_files(offset, limit))
+
+    async def preview_import_apkg(self, filename: str) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.preview_import_apkg_file(filename)
+        )
+
+    async def import_apkg(
+        self,
+        filename: str,
+        merge_notetypes: bool,
+        update_notes: ImportAnkiPackageUpdateCondition.ValueType,
+        update_notetypes: ImportAnkiPackageUpdateCondition.ValueType,
+        with_scheduling: bool,
+        with_deck_configs: bool,
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.import_apkg(
+                filename,
+                merge_notetypes,
+                update_notes,
+                update_notetypes,
+                with_scheduling,
+                with_deck_configs,
+            )
+        )
+
+    async def preview_import_csv(self, filename: str, delimiter: str | None) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.preview_import_csv(filename, delimiter)
+        )
+
+    async def import_csv(
+        self,
+        filename: str,
+        notetype_id: int,
+        field_columns: Sequence[int],
+        deck_id: int,
+        delimiter: str | None,
+        is_html: bool | None,
+        tags: Sequence[str],
+        dupe_resolution: str,
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.import_csv(
+                filename,
+                notetype_id,
+                field_columns,
+                deck_id,
+                delimiter,
+                is_html,
+                tags,
+                dupe_resolution,
             )
         )
 

@@ -113,6 +113,7 @@ def test_scope_and_safety_flags_control_tool_discovery(phase_settings: Settings)
         "anki_media_rename",
         "anki_export_apkg",
         "anki_export_notes_csv",
+        "anki_import_files_list",
         "anki_undo_status",
     ]
     assert all(tool["inputSchema"]["additionalProperties"] is False for tool in tools)
@@ -179,6 +180,7 @@ def test_scope_and_safety_flags_control_tool_discovery(phase_settings: Settings)
         "anki_media_check",
         "anki_export_apkg",
         "anki_export_notes_csv",
+        "anki_import_files_list",
         "anki_undo_status",
     ]
 

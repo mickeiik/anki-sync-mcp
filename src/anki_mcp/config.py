@@ -94,6 +94,7 @@ class Settings(BaseSettings):
     allow_schema_changes: bool = Field(False, alias="ANKI_ALLOW_SCHEMA_CHANGES")
     allow_review_answers: bool = Field(False, alias="ANKI_ALLOW_REVIEW_ANSWERS")
     allow_undo: bool = Field(False, alias="ANKI_ALLOW_UNDO")
+    allow_import: bool = Field(False, alias="ANKI_ALLOW_IMPORT")
     confirmation_ttl_seconds: int = Field(
         300, ge=30, le=3600, alias="ANKI_CONFIRMATION_TTL_SECONDS"
     )
@@ -108,6 +109,9 @@ class Settings(BaseSettings):
     )
     max_card_fields: int = Field(100, ge=1, le=1000, alias="MCP_MAX_CARD_FIELDS")
     max_media_bytes: int = Field(1_048_576, ge=1, le=16_777_216, alias="ANKI_MAX_MEDIA_BYTES")
+    max_import_bytes: int = Field(
+        268_435_456, ge=1_048_576, le=4_294_967_296, alias="ANKI_MAX_IMPORT_BYTES"
+    )
     sync_timeout_seconds: float = Field(300, gt=0, le=3600, alias="ANKI_SYNC_TIMEOUT_SECONDS")
     max_response_bytes: int = Field(
         1_048_576, ge=1024, le=16_777_216, alias="MCP_MAX_RESPONSE_BYTES"

@@ -29,6 +29,7 @@ from starlette.types import ASGIApp
 
 from anki_mcp.auth import BearerAuthMiddleware, RequestBodyLimitMiddleware
 from anki_mcp.collection import (
+    UPDATE_CONDITIONS,
     AnkiCollectionService,
     BackupFailedError,
     CollectionAdapter,
@@ -59,10 +60,15 @@ Tag = Annotated[StrictStr, Field(min_length=1, max_length=512)]
 ResourceName = Annotated[StrictStr, Field(min_length=1, max_length=512)]
 MediaFilename = Annotated[StrictStr, Field(min_length=1, max_length=255)]
 BackupFilename = Annotated[StrictStr, Field(min_length=1, max_length=255)]
+ImportFilename = Annotated[StrictStr, Field(min_length=1, max_length=255)]
+CsvDelimiter = Annotated[StrictStr, Field(min_length=1, max_length=1)]
 RestoreMode = Literal["upload_now", "local_only"]
+CsvDupeResolution = Literal["preserve", "update", "duplicate"]
+UpdateCondition = Literal["ALWAYS", "IF_NEWER", "NEVER"]
 MediaContent = Annotated[StrictStr, Field(min_length=1, max_length=22_369_624)]
 StableIds = Annotated[list[StableId], Field(min_length=1, max_length=500)]
 NonNegativeInt = Annotated[StrictInt, Field(ge=0)]
+CsvFieldColumns = Annotated[list[NonNegativeInt], Field(max_length=1000)]
 PositiveInt = Annotated[StrictInt, Field(gt=0)]
 CardFlag = Annotated[StrictInt, Field(ge=0, le=7)]
 DailyLimit = Annotated[StrictInt, Field(ge=0, le=999_999)]
@@ -465,6 +471,7 @@ def create_app(settings: Settings) -> ASGIApp:
         settings.sync_on_read,
         settings.sync_on_write,
         settings.max_response_bytes,
+        settings.max_import_bytes,
     )
     mcp = FastMCP(
         "anki-mcp",
@@ -2015,6 +2022,150 @@ def create_app(settings: Settings) -> ASGIApp:
                     deck_id, with_html, with_tags, with_deck, with_notetype, with_guid, inline
                 )
             )
+        )
+
+    @scoped_tool(name="anki_import_files_list", scope="read")
+    async def import_files_list(
+        offset: Offset = 0, limit: PageLimit = settings.max_page_size
+    ) -> dict[str, Any]:
+        """List staged .apkg and .csv import files, newest first."""
+        return await execute(service.list_import_files(offset, limit))
+
+    @scoped_tool(
+        name="anki_import_apkg_preview",
+        scope="destructive",
+        enabled=(
+            settings.allow_import and settings.allow_schema_changes and settings.allow_full_sync
+        ),
+    )
+    async def import_apkg_preview(
+        filename: ImportFilename,
+        merge_notetypes: StrictBool = False,
+        update_notes: UpdateCondition = "NEVER",
+        update_notetypes: UpdateCondition = "NEVER",
+        with_scheduling: StrictBool = True,
+        with_deck_configs: StrictBool = False,
+    ) -> dict[str, Any]:
+        """Validate a staged .apkg and preview its import; issues a confirmation token."""
+        request = {
+            "filename": filename,
+            "merge_notetypes": merge_notetypes,
+            "update_notes": update_notes,
+            "update_notetypes": update_notetypes,
+            "with_scheduling": with_scheduling,
+            "with_deck_configs": with_deck_configs,
+        }
+        return await preview(
+            "anki_import_apkg",
+            request,
+            lambda adapter: adapter.preview_import_apkg_file(filename),
+        )
+
+    @scoped_tool(
+        name="anki_import_apkg",
+        scope="destructive",
+        enabled=(
+            settings.allow_import and settings.allow_schema_changes and settings.allow_full_sync
+        ),
+    )
+    async def import_apkg(
+        filename: ImportFilename,
+        confirmation_token: ConfirmationToken,
+        idempotency_key: IdempotencyKey,
+        merge_notetypes: StrictBool = False,
+        update_notes: UpdateCondition = "NEVER",
+        update_notetypes: UpdateCondition = "NEVER",
+        with_scheduling: StrictBool = True,
+        with_deck_configs: StrictBool = False,
+    ) -> dict[str, Any]:
+        """Import a staged .apkg after a matching preview token and verified backup."""
+        request = {
+            "filename": filename,
+            "merge_notetypes": merge_notetypes,
+            "update_notes": update_notes,
+            "update_notetypes": update_notetypes,
+            "with_scheduling": with_scheduling,
+            "with_deck_configs": with_deck_configs,
+        }
+        return await guarded_mutate(
+            "anki_import_apkg",
+            idempotency_key,
+            request,
+            confirmation_token,
+            request,
+            lambda adapter: adapter.preview_import_apkg_file(filename),
+            lambda adapter: adapter.import_apkg(
+                filename,
+                merge_notetypes,
+                UPDATE_CONDITIONS[update_notes],
+                UPDATE_CONDITIONS[update_notetypes],
+                with_scheduling,
+                with_deck_configs,
+            ),
+        )
+
+    @scoped_tool(
+        name="anki_import_csv_preview",
+        scope="destructive",
+        enabled=settings.allow_import,
+    )
+    async def import_csv_preview(
+        filename: ImportFilename, delimiter: CsvDelimiter | None = None
+    ) -> dict[str, Any]:
+        """Validate a staged .csv and preview its metadata and sample rows; issues a token."""
+        request = {"filename": filename, "delimiter": delimiter}
+        return await preview(
+            "anki_import_csv",
+            request,
+            lambda adapter: adapter.preview_import_csv(filename, delimiter),
+        )
+
+    @scoped_tool(
+        name="anki_import_csv",
+        scope="destructive",
+        enabled=settings.allow_import,
+    )
+    async def import_csv(
+        filename: ImportFilename,
+        notetype_id: StableId,
+        field_columns: CsvFieldColumns,
+        deck_id: StableId,
+        confirmation_token: ConfirmationToken,
+        idempotency_key: IdempotencyKey,
+        delimiter: CsvDelimiter | None = None,
+        is_html: StrictBool | None = None,
+        tags: Tags | None = None,
+        dupe_resolution: CsvDupeResolution = "preserve",
+    ) -> dict[str, Any]:
+        """Import a staged .csv into a note type and deck after a matching preview token."""
+        normalized_tags = tags or []
+        request = {
+            "filename": filename,
+            "notetype_id": notetype_id,
+            "field_columns": field_columns,
+            "deck_id": deck_id,
+            "delimiter": delimiter,
+            "is_html": is_html,
+            "tags": normalized_tags,
+            "dupe_resolution": dupe_resolution,
+        }
+        return await guarded_mutate(
+            "anki_import_csv",
+            idempotency_key,
+            request,
+            confirmation_token,
+            {"filename": filename, "delimiter": delimiter},
+            lambda adapter: adapter.preview_import_csv(filename, delimiter),
+            lambda adapter: adapter.import_csv(
+                filename,
+                notetype_id,
+                field_columns,
+                deck_id,
+                delimiter,
+                is_html,
+                normalized_tags,
+                dupe_resolution,
+            ),
         )
 
     @scoped_tool(name="anki_undo_status", scope="read")
