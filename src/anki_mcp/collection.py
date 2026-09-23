@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import shutil
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -28,6 +29,7 @@ from anki.consts import CARD_TYPE_REV, QUEUE_TYPE_SUSPENDED
 from anki.decks import UpdateDeckConfigs
 from anki.errors import InvalidInput, NetworkError, NotFoundError, SearchError, UndoEmpty
 from anki.import_export_pb2 import ExportAnkiPackageOptions
+from anki.media import media_paths_from_col_path
 from anki.scheduler_pb2 import SimulateFsrsReviewRequest
 from anki.sync import SyncAuth
 from anki.utils import field_checksum
@@ -188,6 +190,7 @@ class CollectionAdapter:
         self._last_sync_at = status.get("last_sync_at")
         self._last_media_sync_at = status.get("last_media_sync_at")
         self._media_sync_progress = status.get("media_sync_progress")
+        self._post_restore_upload = bool(status.get("post_restore_upload", False))
 
     def close(self) -> None:
         try:
@@ -220,6 +223,7 @@ class CollectionAdapter:
                 "last_media_sync_at": self._last_media_sync_at,
                 "media_sync_progress": self._media_sync_progress,
                 "pending_full_sync": pending,
+                "post_restore_upload": self._post_restore_upload,
             }
         )
 
@@ -254,6 +258,7 @@ class CollectionAdapter:
             "ready": ready,
             "readiness_reason": reason,
             "pending_full_sync": pending_name,
+            "post_restore_upload_pending": bool(self._post_restore_upload),
             "last_sync_at": self._last_sync_at,
             "last_media_sync_at": self._last_media_sync_at,
             "media_sync_progress": self._media_sync_progress,
@@ -371,6 +376,171 @@ class CollectionAdapter:
             raise BackupFailedError("required current pre-operation backup is unavailable")
         return {**mutation(), "backup": backup}
 
+    def list_backups(self, offset: int, limit: int) -> dict[str, Any]:
+        """List validation-agnostic backup metadata, newest first."""
+        items: list[dict[str, Any]] = []
+        if self._backup_folder.is_dir():
+            for path in self._backup_folder.glob("*.colpkg"):
+                if path.is_file() and not path.is_symlink():
+                    stat = path.stat()
+                    items.append(
+                        {
+                            "filename": path.name,
+                            "size_bytes": stat.st_size,
+                            "mtime": stat.st_mtime,
+                        }
+                    )
+        items.sort(key=lambda item: item["mtime"], reverse=True)
+        return self._page(items, offset, limit)
+
+    def _backup_path(self, filename: str, *, require_exists: bool) -> Path:
+        if (
+            "\x00" in filename
+            or not filename.strip()
+            or Path(filename).name != filename
+            or any(separator in filename for separator in ("/", "\\"))
+        ):
+            raise ValueError("backup filename must be a plain filename without path separators")
+        if not filename.endswith(".colpkg"):
+            raise ValueError("backup filename must end with .colpkg")
+        path = self._backup_folder / filename
+        if path.is_symlink():
+            raise ValueError("backup filename must not reference a symbolic link")
+        if path.resolve().parent != self._backup_folder.resolve():
+            raise ValueError("backup filename must resolve inside the backup folder")
+        if require_exists and not path.is_file():
+            raise LookupError(f"backup {filename} not found")
+        return path
+
+    def _newest_valid_backup(self) -> Path | None:
+        candidates = [
+            path
+            for path in self._backup_folder.glob("*.colpkg")
+            if path.is_file() and not path.is_symlink()
+        ]
+        for candidate in sorted(
+            candidates, key=lambda item: item.stat().st_mtime_ns, reverse=True
+        ):
+            if self._is_valid_backup(candidate):
+                return candidate
+        return None
+
+    def preview_backup_restore(self, filename: str) -> dict[str, Any]:
+        """Validate a named backup and report the impact of restoring it."""
+        path = self._backup_path(filename, require_exists=True)
+        if not self._is_valid_backup(path):
+            raise ValueError("backup is not a valid Anki collection package")
+        stat = path.stat()
+        return {
+            "filename": filename,
+            "size_bytes": stat.st_size,
+            "mtime": stat.st_mtime,
+            "validated": True,
+            "current": {
+                "cards": int(self.collection.card_count()),
+                "notes": int(self.collection.note_count()),
+                "decks": int(self.collection.decks.count()),
+            },
+            "post_restore_modes": ["upload_now", "local_only"],
+        }
+
+    def restore_backup(self, filename: str, mode: str) -> dict[str, Any]:
+        """Replace the live collection with a verified backup, then report recovery state."""
+        if mode not in {"upload_now", "local_only"}:
+            raise ValueError("mode must be upload_now or local_only")
+        if mode == "upload_now" and self._sync_auth is None:
+            raise SyncLoginRequiredError(
+                "sync login is required before uploading a restored collection"
+            )
+        path = self._backup_path(filename, require_exists=True)
+        if not self._is_valid_backup(path):
+            raise ValueError("backup is not a valid Anki collection package")
+        media_folder = self.collection.media.dir()
+        media_db = media_paths_from_col_path(self.collection.path)[1]
+        # Snapshot the requested package first: the pre-restore backup can reuse or
+        # overwrite a same-second native filename, and the restore must always apply
+        # exactly the content that was previewed.
+        with TemporaryDirectory(prefix="anki-mcp-restore-") as temporary:
+            snapshot = Path(temporary) / "target.colpkg"
+            shutil.copy2(path, snapshot)
+            backup = self.create_backup()
+            if not isinstance(backup.get("path"), str):
+                raise BackupFailedError(
+                    "required current pre-restore backup is unavailable"
+                )
+            self.collection.close()
+            try:
+                RustBackend().import_collection_package(
+                    col_path=self.collection.path,
+                    backup_path=str(snapshot),
+                    media_folder=media_folder,
+                    media_db=media_db,
+                )
+                self.collection.reopen()
+                self.collection._load_scheduler()  # pyright: ignore[reportPrivateUsage]
+            except Exception:
+                if self.collection.db is None:
+                    try:
+                        self.collection.reopen()
+                    except Exception as reopen_exc:
+                        recovery = self._newest_valid_backup()
+                        recovery_hint = (
+                            str(recovery) if recovery is not None else str(self._backup_folder)
+                        )
+                        raise RuntimeError(
+                            "restore failed and the collection could not be reopened; restart the "
+                            "sidecar and restore the collection from the pre-restore backup at "
+                            f"{recovery_hint}"
+                        ) from reopen_exc
+                raise
+        self._pending_full_sync = None
+        self._state.mark_pending_discarded_by_restore()
+        self._post_restore_upload = True
+        self._save_operational_status()
+
+        if mode == "local_only":
+            server_sync_required: str | None = None
+            if self._sync_auth is not None:
+                try:
+                    server_sync_required = SYNC_REQUIRED_NAMES[
+                        self.collection.sync_status(self._sync_auth).required
+                    ]
+                except NetworkError:
+                    server_sync_required = None
+            return {
+                "restored": True,
+                "mode": mode,
+                "remote_replaced": False,
+                "server_sync_required": server_sync_required,
+                "backup": backup,
+                "warning": (
+                    "the server still holds its pre-restore state; a normal sync would merge it "
+                    "onto this backup — use anki_sync_full_upload(force=true) to overwrite the "
+                    "server instead"
+                ),
+            }
+
+        try:
+            self.collection.full_upload_or_download(
+                auth=self._sync_auth, server_usn=None, upload=True
+            )
+        except Exception as exc:
+            if not isinstance(exc, NetworkError):
+                self._invalidate_sync_auth()
+            raise
+        self._post_restore_upload = False
+        self._last_sync_at = datetime.now(UTC).isoformat()
+        self._state.mark_all_remote_synced()
+        self._save_operational_status()
+        return {
+            "restored": True,
+            "mode": mode,
+            "remote_replaced": True,
+            "server_sync_required": None,
+            "backup": backup,
+            "warning": None,
+        }
+
     def bootstrap(
         self,
         mode: str,
@@ -419,6 +589,7 @@ class CollectionAdapter:
         request: dict[str, Any],
         mutate: Callable[[CollectionAdapter], dict[str, Any]],
         sync_media: bool = False,
+        sync_after: bool = True,
     ) -> dict[str, Any]:
         started = time.monotonic()
 
@@ -480,14 +651,14 @@ class CollectionAdapter:
             audit(receipt)
             return receipt
 
-        if self.sync_on_write:
+        if sync_after and self.sync_on_write:
             self._sync_or_raise_full_sync(sync_media=sync_media)
         intent: dict[str, Any] = {
             "idempotency_key": idempotency_key,
             "state": "outcome_unknown",
             "local_committed": None,
-            "remote_synced": False,
-            "media_synced": False if sync_media else None,
+            "remote_synced": None if not sync_after else False,
+            "media_synced": (False if sync_media else None) if sync_after else None,
             "retryable": False,
             "result": None,
         }
@@ -501,13 +672,15 @@ class CollectionAdapter:
             "idempotency_key": idempotency_key,
             "state": "committed",
             "local_committed": True,
-            "remote_synced": not self.sync_on_write,
-            "media_synced": not self.sync_on_write if sync_media else None,
+            "remote_synced": None if not sync_after else not self.sync_on_write,
+            "media_synced": (
+                (not self.sync_on_write if sync_media else None) if sync_after else None
+            ),
             "retryable": False,
             "result": result,
         }
         self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
-        if self.sync_on_write:
+        if sync_after and self.sync_on_write:
             try:
                 self._sync_or_raise_full_sync(sync_media=sync_media)
             except FullSyncRequiredError:
@@ -2996,6 +3169,9 @@ class CollectionAdapter:
             else:
                 self._pending_full_sync = None
             self._last_sync_at = datetime.now(UTC).isoformat()
+            required = SYNC_REQUIRED_NAMES[output.required]
+            if self._post_restore_upload and required in {"NO_CHANGES", "NORMAL_SYNC"}:
+                self._post_restore_upload = False
             self._state.save_sync_auth(
                 {
                     "hkey": self._sync_auth.hkey,
@@ -3004,7 +3180,6 @@ class CollectionAdapter:
                 }
             )
             self._save_operational_status()
-            required = SYNC_REQUIRED_NAMES[output.required]
             media_sync = self._wait_for_media_sync() if sync_media else None
             server_message, server_message_truncated = self._truncate_rendered(
                 output.server_message
@@ -3023,16 +3198,23 @@ class CollectionAdapter:
                 self._invalidate_sync_auth()
             raise
 
-    def full_sync(self, upload: bool) -> dict[str, Any]:
+    def full_sync(self, upload: bool, force: bool = False) -> dict[str, Any]:
         if self._sync_auth is None:
             raise SyncLoginRequiredError("sync login is required before full synchronization")
-        if self._pending_full_sync is None:
-            raise ValueError("a full sync was not requested by the remote server")
-        required, server_usn = self._pending_full_sync
-        if required == 3 and upload:
-            raise ValueError("the remote server requires a full download")
-        if required == 4 and not upload:
-            raise ValueError("the remote server requires a full upload")
+        if force:
+            if not upload:
+                raise ValueError("force is only supported for a full upload")
+            if not self._post_restore_upload:
+                raise ValueError("no post-restore upload is pending")
+            server_usn = None
+        else:
+            if self._pending_full_sync is None:
+                raise ValueError("a full sync was not requested by the remote server")
+            required, server_usn = self._pending_full_sync
+            if required == 3 and upload:
+                raise ValueError("the remote server requires a full download")
+            if required == 4 and not upload:
+                raise ValueError("the remote server requires a full upload")
         try:
             self._backup_folder.mkdir(parents=True, exist_ok=True)
             backup_created = self.collection.create_backup(
@@ -3055,6 +3237,8 @@ class CollectionAdapter:
             self._state.mark_all_remote_synced()
         else:
             self._state.mark_pending_discarded_by_full_download()
+        if force:
+            self._post_restore_upload = False
         self._save_operational_status()
         return {
             "completed": True,
@@ -3749,10 +3933,11 @@ class AnkiCollectionService:
         request: dict[str, Any],
         mutate: Callable[[CollectionAdapter], dict[str, Any]],
         sync_media: bool = False,
+        sync_after: bool = True,
     ) -> dict[str, Any]:
         return await self.executor.run(
             lambda adapter: adapter.coordinated_mutation(
-                operation, idempotency_key, request, mutate, sync_media
+                operation, idempotency_key, request, mutate, sync_media, sync_after
             )
         )
 
@@ -3770,6 +3955,19 @@ class AnkiCollectionService:
 
     async def create_backup(self) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.create_backup())
+
+    async def list_backups(self, offset: int, limit: int) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.list_backups(offset, limit))
+
+    async def preview_backup_restore(self, filename: str) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.preview_backup_restore(filename)
+        )
+
+    async def restore_backup(self, filename: str, mode: str) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.restore_backup(filename, mode)
+        )
 
     async def bootstrap(
         self,
@@ -3792,8 +3990,8 @@ class AnkiCollectionService:
     async def sync(self, sync_media: bool) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.sync(sync_media))
 
-    async def full_sync(self, upload: bool) -> dict[str, Any]:
-        return await self.executor.run(lambda adapter: adapter.full_sync(upload))
+    async def full_sync(self, upload: bool, force: bool = False) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.full_sync(upload, force))
 
     async def check_ready(self) -> bool:
         return await self.executor.run(lambda adapter: adapter.check_ready())

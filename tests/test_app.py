@@ -205,6 +205,7 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_sync_full_download",
         "anki_sync_full_upload",
         "anki_backup_create",
+        "anki_backups_list",
         "anki_decks_list",
         "anki_decks_get",
         "anki_deck_options_get",

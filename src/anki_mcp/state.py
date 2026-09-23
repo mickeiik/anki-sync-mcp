@@ -152,8 +152,11 @@ class PersistentState:
             committed += receipt.get("state") == "committed"
             outcome_unknown += receipt.get("state") == "outcome_unknown"
             pending += (
-                not bool(receipt.get("remote_synced")) or receipt.get("media_synced") is False
-            ) and receipt.get("state") != "discarded_by_full_download"
+                receipt.get("remote_synced") is False or receipt.get("media_synced") is False
+            ) and receipt.get("state") not in {
+                "discarded_by_full_download",
+                "discarded_by_restore",
+            }
         return {
             "mutations": {
                 "total": len(rows),
@@ -171,8 +174,9 @@ class PersistentState:
     def pending_receipt_count(self) -> int:
         rows = self.connection.execute("select receipt_json from mutation_receipts").fetchall()
         return sum(
-            (not bool(receipt.get("remote_synced")) or receipt.get("media_synced") is False)
-            and receipt.get("state") != "discarded_by_full_download"
+            (receipt.get("remote_synced") is False or receipt.get("media_synced") is False)
+            and receipt.get("state")
+            not in {"discarded_by_full_download", "discarded_by_restore"}
             for row in rows
             if isinstance((receipt := json.loads(row[0])), dict)
         )
@@ -204,6 +208,13 @@ class PersistentState:
 
     def mark_pending_discarded_by_full_download(self) -> None:
         """Mark local-only mutation results as discarded by a full download."""
+        self._mark_pending_discarded("discarded_by_full_download")
+
+    def mark_pending_discarded_by_restore(self) -> None:
+        """Mark local-only mutation results as discarded by a collection restore."""
+        self._mark_pending_discarded("discarded_by_restore")
+
+    def _mark_pending_discarded(self, discarded_state: str) -> None:
         rows = self.connection.execute(
             "select idempotency_key, receipt_json from mutation_receipts"
         ).fetchall()
@@ -224,7 +235,7 @@ class PersistentState:
             ) and not receipt.get("remote_synced"):
                 receipt.update(
                     {
-                        "state": "discarded_by_full_download",
+                        "state": discarded_state,
                         "local_committed": False,
                         "remote_synced": False,
                         "retryable": False,

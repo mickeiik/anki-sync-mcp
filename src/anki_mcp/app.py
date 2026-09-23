@@ -57,6 +57,8 @@ OperationName = Annotated[StrictStr, Field(min_length=1, max_length=128)]
 Tag = Annotated[StrictStr, Field(min_length=1, max_length=512)]
 ResourceName = Annotated[StrictStr, Field(min_length=1, max_length=512)]
 MediaFilename = Annotated[StrictStr, Field(min_length=1, max_length=255)]
+BackupFilename = Annotated[StrictStr, Field(min_length=1, max_length=255)]
+RestoreMode = Literal["upload_now", "local_only"]
 MediaContent = Annotated[StrictStr, Field(min_length=1, max_length=22_369_624)]
 StableIds = Annotated[list[StableId], Field(min_length=1, max_length=500)]
 NonNegativeInt = Annotated[StrictInt, Field(ge=0)]
@@ -569,10 +571,13 @@ def create_app(settings: Settings) -> ASGIApp:
         request: dict[str, Any],
         function: Callable[[CollectionAdapter], dict[str, Any]],
         sync_media: bool = False,
+        sync_after: bool = True,
     ) -> dict[str, Any]:
         key = idempotency_key or str(uuid4())
         result = await execute(
-            service.coordinated_mutation(operation, key, request, function, sync_media=sync_media)
+            service.coordinated_mutation(
+                operation, key, request, function, sync_media=sync_media, sync_after=sync_after
+            )
         )
         if not isinstance(result, dict):  # pragma: no cover - coordinator always returns a receipt
             raise RuntimeError("mutation coordinator returned an invalid receipt")
@@ -605,6 +610,8 @@ def create_app(settings: Settings) -> ASGIApp:
         function: Callable[[CollectionAdapter], dict[str, Any]],
         *,
         sync_media: bool = False,
+        sync_after: bool = True,
+        pre_backup: bool = True,
     ) -> dict[str, Any]:
         def guarded(adapter: CollectionAdapter) -> dict[str, Any]:
             current_impact = preview_function(adapter)
@@ -621,7 +628,9 @@ def create_app(settings: Settings) -> ASGIApp:
                     raise ConfirmationRequiredError(f"{exc}; run preview again") from exc
                 return function(adapter)
 
-            return adapter.backup_before(confirmed_mutation)
+            if pre_backup:
+                return adapter.backup_before(confirmed_mutation)
+            return confirmed_mutation()
 
         return await mutate(
             operation,
@@ -629,6 +638,7 @@ def create_app(settings: Settings) -> ASGIApp:
             request,
             guarded,
             sync_media=sync_media,
+            sync_after=sync_after,
         )
 
     @scoped_tool(name="anki_status", scope="read")
@@ -684,17 +694,63 @@ def create_app(settings: Settings) -> ASGIApp:
         return await execute(service.full_sync(upload=False))
 
     @scoped_tool(name="anki_sync_full_upload", scope="admin", enabled=settings.allow_full_sync)
-    async def sync_full_upload(confirm: Confirmation = False) -> dict[str, Any]:
-        """Replace remote data after the server requires a full upload and confirmation is true."""
+    async def sync_full_upload(
+        confirm: Confirmation = False, force: StrictBool = False
+    ) -> dict[str, Any]:
+        """Replace remote data after a full upload is required or a restore needs overwriting."""
         if not confirm:
             cause = ValueError("confirm must be true for full upload")
             raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
-        return await execute(service.full_sync(upload=True))
+        return await execute(service.full_sync(upload=True, force=force))
 
     @scoped_tool(name="anki_backup_create", scope="admin")
     async def backup_create() -> dict[str, Any]:
         """Create an explicit local collection backup in persistent storage."""
         return await execute(service.create_backup())
+
+    @scoped_tool(name="anki_backups_list", scope="read")
+    async def backups_list(
+        offset: Offset = 0, limit: PageLimit = settings.max_page_size
+    ) -> dict[str, Any]:
+        """List available local collection backups, newest first."""
+        return await execute(service.list_backups(offset, limit))
+
+    @scoped_tool(
+        name="anki_backup_restore_preview",
+        scope="destructive",
+        enabled=settings.allow_restore and settings.allow_full_sync,
+    )
+    async def backup_restore_preview(filename: BackupFilename) -> dict[str, Any]:
+        """Validate one backup and preview the impact of restoring it; issues a token."""
+        return await preview(
+            "anki_backup_restore",
+            {"filename": filename},
+            lambda adapter: adapter.preview_backup_restore(filename),
+        )
+
+    @scoped_tool(
+        name="anki_backup_restore",
+        scope="destructive",
+        enabled=settings.allow_restore and settings.allow_full_sync,
+    )
+    async def backup_restore(
+        filename: BackupFilename,
+        mode: RestoreMode,
+        confirmation_token: ConfirmationToken,
+        idempotency_key: IdempotencyKey,
+    ) -> dict[str, Any]:
+        """Replace the live collection with a verified backup after a matching preview token."""
+        return await guarded_mutate(
+            "anki_backup_restore",
+            idempotency_key,
+            {"filename": filename, "mode": mode},
+            confirmation_token,
+            {"filename": filename},
+            lambda adapter: adapter.preview_backup_restore(filename),
+            lambda adapter: adapter.restore_backup(filename, mode),
+            sync_after=False,
+            pre_backup=False,
+        )
 
     @scoped_tool(name="anki_decks_list", scope="read")
     async def decks_list(

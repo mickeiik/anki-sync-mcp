@@ -90,6 +90,7 @@ class Settings(BaseSettings):
     sync_on_write: bool = Field(True, alias="ANKI_SYNC_ON_WRITE")
     allow_destructive: bool = Field(False, alias="ANKI_ALLOW_DESTRUCTIVE")
     allow_full_sync: bool = Field(False, alias="ANKI_ALLOW_FULL_SYNC")
+    allow_restore: bool = Field(False, alias="ANKI_ALLOW_RESTORE")
     allow_schema_changes: bool = Field(False, alias="ANKI_ALLOW_SCHEMA_CHANGES")
     allow_review_answers: bool = Field(False, alias="ANKI_ALLOW_REVIEW_ANSWERS")
     allow_undo: bool = Field(False, alias="ANKI_ALLOW_UNDO")
