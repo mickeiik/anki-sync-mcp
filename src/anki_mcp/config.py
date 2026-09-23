@@ -92,6 +92,7 @@ class Settings(BaseSettings):
     allow_full_sync: bool = Field(False, alias="ANKI_ALLOW_FULL_SYNC")
     allow_schema_changes: bool = Field(False, alias="ANKI_ALLOW_SCHEMA_CHANGES")
     allow_review_answers: bool = Field(False, alias="ANKI_ALLOW_REVIEW_ANSWERS")
+    allow_undo: bool = Field(False, alias="ANKI_ALLOW_UNDO")
     confirmation_ttl_seconds: int = Field(
         300, ge=30, le=3600, alias="ANKI_CONFIRMATION_TTL_SECONDS"
     )

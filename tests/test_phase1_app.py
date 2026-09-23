@@ -110,6 +110,9 @@ def test_scope_and_safety_flags_control_tool_discovery(phase_settings: Settings)
         "anki_media_check",
         "anki_media_store",
         "anki_media_rename",
+        "anki_export_apkg",
+        "anki_export_notes_csv",
+        "anki_undo_status",
     ]
     assert all(tool["inputSchema"]["additionalProperties"] is False for tool in tools)
     assert "anki_decks_delete" not in names
@@ -172,6 +175,9 @@ def test_scope_and_safety_flags_control_tool_discovery(phase_settings: Settings)
         "anki_media_list",
         "anki_media_get",
         "anki_media_check",
+        "anki_export_apkg",
+        "anki_export_notes_csv",
+        "anki_undo_status",
     ]
 
     all_enabled = phase_settings.model_copy(

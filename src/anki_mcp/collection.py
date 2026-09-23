@@ -16,15 +16,17 @@ from importlib.metadata import version
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any, TypeVar, cast
+from uuid import uuid4
 from zipfile import ZipFile
 
 import anki.lang
 from anki._backend import RustBackend
-from anki.collection import AddNoteRequest, Collection
+from anki.collection import AddNoteRequest, Collection, DeckIdLimit
 from anki.config_pb2 import ConfigKey
 from anki.consts import CARD_TYPE_REV, QUEUE_TYPE_SUSPENDED
 from anki.decks import UpdateDeckConfigs
 from anki.errors import InvalidInput, NetworkError, NotFoundError, SearchError
+from anki.import_export_pb2 import ExportAnkiPackageOptions
 from anki.scheduler_pb2 import SimulateFsrsReviewRequest
 from anki.sync import SyncAuth
 from anki.utils import field_checksum
@@ -47,6 +49,10 @@ SYNC_REQUIRED_NAMES = (
     "FULL_SYNC",
     "FULL_DOWNLOAD",
     "FULL_UPLOAD",
+)
+UNDO_HISTORY_NOTE = (
+    "Undo/redo history is held in memory for the running collection process; it is cleared by "
+    "synchronization and is not durable across restarts or full downloads."
 )
 DECK_PRESET_SECTIONS: dict[str, tuple[str, ...]] = {
     "learning": (
@@ -141,6 +147,7 @@ class CollectionAdapter:
         sync_timeout_seconds: float = 300,
         sync_on_read: bool = False,
         sync_on_write: bool = False,
+        max_response_bytes: int = 1_048_576,
     ) -> None:
         if anki.lang.current_i18n is None:
             anki.lang.set_lang("en_US")
@@ -154,7 +161,9 @@ class CollectionAdapter:
         self.sync_timeout_seconds = sync_timeout_seconds
         self.sync_on_read = sync_on_read
         self.sync_on_write = sync_on_write
+        self.max_response_bytes = max_response_bytes
         self._backup_folder = Path(path).parent / "backups"
+        self._exports_folder = Path(path).parent / "exports"
         self._state = PersistentState(path)
         persisted_auth = self._state.load_sync_auth()
         self._sync_auth = (
@@ -3052,6 +3061,142 @@ class CollectionAdapter:
             "backup_created": backup_created,
         }
 
+    def _export_card_count(self, deck_id: int | None) -> int:
+        if deck_id is None:
+            return int(self.collection.card_count())
+        self.get_deck(deck_id)
+        return len(self.collection.find_cards(f"did:{deck_id}"))
+
+    def _require_within_export_bound(self, deck_id: int | None) -> None:
+        if self._export_card_count(deck_id) > self.max_search_scan:
+            raise ValueError(
+                "export scope exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
+            )
+
+    def _new_export_path(self, suffix: str) -> tuple[str, Path]:
+        filename = (
+            f"export-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}{suffix}"
+        )
+        if (
+            "\x00" in filename
+            or not filename.strip()
+            or Path(filename).name != filename
+            or any(separator in filename for separator in ("/", "\\"))
+        ):
+            raise ValueError("export filename must be a plain filename without path separators")
+        self._exports_folder.mkdir(parents=True, exist_ok=True)
+        path = self._exports_folder / filename
+        if path.is_symlink():
+            raise ValueError("export filename must not reference a symbolic link")
+        return filename, path
+
+    def _export_result(self, filename: str, path: Path, extra: dict[str, Any]) -> dict[str, Any]:
+        content = path.read_bytes()
+        return {
+            "filename": filename,
+            "path": str(path.resolve()),
+            "size_bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            **extra,
+        }
+
+    def export_apkg(
+        self,
+        deck_id: int | None,
+        include_media: bool,
+        include_scheduling: bool,
+        include_deck_configs: bool,
+    ) -> dict[str, Any]:
+        """Export the collection (or one deck) to a generated ``.apkg`` file."""
+        self._require_within_export_bound(deck_id)
+        filename, path = self._new_export_path(".apkg")
+        exported_cards = int(
+            self.collection.export_anki_package(
+                out_path=str(path),
+                options=ExportAnkiPackageOptions(
+                    with_scheduling=include_scheduling,
+                    with_deck_configs=include_deck_configs,
+                    with_media=include_media,
+                    legacy=False,
+                ),
+                limit=DeckIdLimit(cast("DeckId", deck_id)) if deck_id is not None else None,
+            )
+        )
+        return self._export_result(filename, path, {"exported_cards": exported_cards})
+
+    def export_notes_csv(
+        self,
+        deck_id: int | None,
+        with_html: bool,
+        with_tags: bool,
+        with_deck: bool,
+        with_notetype: bool,
+        with_guid: bool,
+        inline: bool,
+    ) -> dict[str, Any]:
+        """Export notes (whole collection or one deck) to a generated ``.csv`` file."""
+        self._require_within_export_bound(deck_id)
+        filename, path = self._new_export_path(".csv")
+        rows = int(
+            self.collection.export_note_csv(
+                out_path=str(path),
+                limit=DeckIdLimit(cast("DeckId", deck_id)) if deck_id is not None else None,
+                with_html=with_html,
+                with_tags=with_tags,
+                with_deck=with_deck,
+                with_notetype=with_notetype,
+                with_guid=with_guid,
+            )
+        )
+        content = path.read_bytes()
+        result = {
+            "filename": filename,
+            "path": str(path.resolve()),
+            "size_bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "rows": rows,
+        }
+        if inline:
+            encoded = base64.b64encode(content)
+            if len(encoded) <= self.max_response_bytes - 8192:
+                result["content_base64"] = encoded.decode("ascii")
+            else:
+                result["inline_omitted"] = True
+                result["inline_reason"] = "exceeds MCP_MAX_RESPONSE_BYTES"
+        return result
+
+    def undo_status(self) -> dict[str, Any]:
+        status = self.collection.undo_status()
+        return {
+            "undo": str(status.undo),
+            "redo": str(status.redo),
+            "last_step": int(status.last_step),
+            "durable": False,
+            "note": UNDO_HISTORY_NOTE,
+        }
+
+    def undo(self, expect_operation: str) -> dict[str, Any]:
+        return self._history_step(expect_operation, redo=False)
+
+    def redo(self, expect_operation: str) -> dict[str, Any]:
+        return self._history_step(expect_operation, redo=True)
+
+    def _history_step(self, expect_operation: str, *, redo: bool) -> dict[str, Any]:
+        status = self.collection.undo_status()
+        label = "redo" if redo else "undo"
+        head = status.redo if redo else status.undo
+        if str(head) != expect_operation:
+            raise ValueError(
+                f"{label} stack head is {head!r}, not {expect_operation!r}; "
+                "call anki_undo_status first"
+            )
+        result = self.collection.redo() if redo else self.collection.undo()
+        return {
+            "operation_undone": expect_operation,
+            "operation": str(result.operation),
+            "new_status": self.undo_status(),
+        }
+
     def _truncate_rendered(self, value: str) -> tuple[str, bool]:
         encoded = value.encode("utf-8")
         if len(encoded) <= self.max_rendered_field_bytes:
@@ -3075,6 +3220,7 @@ class CollectionExecutor:
         sync_timeout_seconds: float = 300,
         sync_on_read: bool = False,
         sync_on_write: bool = False,
+        max_response_bytes: int = 1_048_576,
     ) -> None:
         self._path = path
         self._max_page_size = max_page_size
@@ -3086,6 +3232,7 @@ class CollectionExecutor:
         self._sync_timeout_seconds = sync_timeout_seconds
         self._sync_on_read = sync_on_read
         self._sync_on_write = sync_on_write
+        self._max_response_bytes = max_response_bytes
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="anki-collection")
         self._adapter: CollectionAdapter | None = None
         self._worker_id: int | None = None
@@ -3109,6 +3256,7 @@ class CollectionExecutor:
                 self._sync_timeout_seconds,
                 self._sync_on_read,
                 self._sync_on_write,
+                self._max_response_bytes,
             )
 
         self._pool.submit(open_collection).result()
@@ -3148,6 +3296,7 @@ class AnkiCollectionService:
         sync_timeout_seconds: float = 300,
         sync_on_read: bool = False,
         sync_on_write: bool = False,
+        max_response_bytes: int = 1_048_576,
     ) -> None:
         self.executor = CollectionExecutor(
             path,
@@ -3160,6 +3309,7 @@ class AnkiCollectionService:
             sync_timeout_seconds,
             sync_on_read,
             sync_on_write,
+            max_response_bytes,
         )
 
     async def __aenter__(self) -> AnkiCollectionService:
@@ -3441,6 +3591,44 @@ class AnkiCollectionService:
 
     async def check_media(self, offset: int, limit: int) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.check_media(offset, limit))
+
+    async def export_apkg(
+        self,
+        deck_id: int | None,
+        include_media: bool,
+        include_scheduling: bool,
+        include_deck_configs: bool,
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.export_apkg(
+                deck_id, include_media, include_scheduling, include_deck_configs
+            )
+        )
+
+    async def export_notes_csv(
+        self,
+        deck_id: int | None,
+        with_html: bool,
+        with_tags: bool,
+        with_deck: bool,
+        with_notetype: bool,
+        with_guid: bool,
+        inline: bool,
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.export_notes_csv(
+                deck_id, with_html, with_tags, with_deck, with_notetype, with_guid, inline
+            )
+        )
+
+    async def undo_status(self) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.undo_status())
+
+    async def undo(self, expect_operation: str) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.undo(expect_operation))
+
+    async def redo(self, expect_operation: str) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.redo(expect_operation))
 
     async def search_cards(self, query: str, offset: int, limit: int) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.search_cards(query, offset, limit))

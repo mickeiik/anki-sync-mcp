@@ -266,6 +266,9 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_media_rename",
         "anki_media_delete_preview",
         "anki_media_delete",
+        "anki_export_apkg",
+        "anki_export_notes_csv",
+        "anki_undo_status",
     ]
     assert all(tool["inputSchema"]["additionalProperties"] is False for tool in tools)
     paginated = [tool for tool in tools if "limit" in tool["inputSchema"]["properties"]]

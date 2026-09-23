@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from typing import Annotated, Any, Generic, Literal, NoReturn, TypeVar, cast
 from uuid import uuid4
 
-from anki.errors import NetworkError, SyncError, SyncErrorKind
+from anki.errors import NetworkError, SyncError, SyncErrorKind, UndoEmpty
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
@@ -53,6 +53,7 @@ DeckName = Annotated[StrictStr, Field(min_length=1, max_length=512)]
 SearchQuery = Annotated[StrictStr, Field(max_length=4096)]
 CardText = Annotated[StrictStr, Field(max_length=262_144)]
 IdempotencyKey = Annotated[StrictStr, Field(min_length=1, max_length=128)]
+OperationName = Annotated[StrictStr, Field(min_length=1, max_length=128)]
 Tag = Annotated[StrictStr, Field(min_length=1, max_length=512)]
 ResourceName = Annotated[StrictStr, Field(min_length=1, max_length=512)]
 MediaFilename = Annotated[StrictStr, Field(min_length=1, max_length=255)]
@@ -460,6 +461,7 @@ def create_app(settings: Settings) -> ASGIApp:
         settings.sync_timeout_seconds,
         settings.sync_on_read,
         settings.sync_on_write,
+        settings.max_response_bytes,
     )
     mcp = FastMCP(
         "anki-mcp",
@@ -544,6 +546,8 @@ def create_app(settings: Settings) -> ASGIApp:
                 exc,
                 log_cause=True,
             )
+        except UndoEmpty as exc:
+            raise_tool_error("UNDO_UNAVAILABLE", str(exc), exc)
         except ResponseTooLargeError as exc:
             raise_tool_error("RESPONSE_TOO_LARGE", str(exc), exc)
         except NetworkError as exc:
@@ -1917,6 +1921,70 @@ def create_app(settings: Settings) -> ASGIApp:
             lambda adapter: adapter.preview_media_delete(filename),
             lambda adapter: adapter.delete_media(filename),
             sync_media=True,
+        )
+
+    @scoped_tool(name="anki_export_apkg", scope="read")
+    async def export_apkg(
+        deck_id: StableId | None = None,
+        include_media: StrictBool = True,
+        include_scheduling: StrictBool = True,
+        include_deck_configs: StrictBool = False,
+    ) -> dict[str, Any]:
+        """Export the collection or one deck to a generated .apkg file under <parent>/exports."""
+        return await execute(
+            service.coordinated_read(
+                lambda adapter: adapter.export_apkg(
+                    deck_id, include_media, include_scheduling, include_deck_configs
+                )
+            )
+        )
+
+    @scoped_tool(name="anki_export_notes_csv", scope="read")
+    async def export_notes_csv(
+        deck_id: StableId | None = None,
+        with_html: StrictBool = True,
+        with_tags: StrictBool = True,
+        with_deck: StrictBool = True,
+        with_notetype: StrictBool = False,
+        with_guid: StrictBool = False,
+        inline: StrictBool = False,
+    ) -> dict[str, Any]:
+        """Export notes to a generated .csv file, optionally inlining small content as base64."""
+        return await execute(
+            service.coordinated_read(
+                lambda adapter: adapter.export_notes_csv(
+                    deck_id, with_html, with_tags, with_deck, with_notetype, with_guid, inline
+                )
+            )
+        )
+
+    @scoped_tool(name="anki_undo_status", scope="read")
+    async def undo_status() -> dict[str, Any]:
+        """Report the in-memory undo and redo stack heads for the running collection process."""
+        return await execute(service.coordinated_read(lambda adapter: adapter.undo_status()))
+
+    @scoped_tool(name="anki_undo", scope="destructive", enabled=settings.allow_undo)
+    async def undo(
+        expect_operation: OperationName, idempotency_key: IdempotencyKey
+    ) -> dict[str, Any]:
+        """Undo the current stack head after confirming it matches expect_operation."""
+        return await mutate(
+            "anki_undo",
+            idempotency_key,
+            {"expect_operation": expect_operation},
+            lambda adapter: adapter.undo(expect_operation),
+        )
+
+    @scoped_tool(name="anki_redo", scope="destructive", enabled=settings.allow_undo)
+    async def redo(
+        expect_operation: OperationName, idempotency_key: IdempotencyKey
+    ) -> dict[str, Any]:
+        """Redo the current redo stack head after confirming it matches expect_operation."""
+        return await mutate(
+            "anki_redo",
+            idempotency_key,
+            {"expect_operation": expect_operation},
+            lambda adapter: adapter.redo(expect_operation),
         )
 
     # FastMCP currently generates argument models with Pydantic's extra="ignore".
