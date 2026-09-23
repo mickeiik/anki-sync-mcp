@@ -511,29 +511,42 @@ class CollectionAdapter:
         )
         if mode == "local_only":
             server_sync_required: str | None = None
-            if self._sync_auth is not None:
+            if self._sync_auth is None:
+                warning = (
+                    "sync login is required to inspect the server; it still holds its pre-restore "
+                    "state — once logged in, use anki_sync_full_upload(force=true) to replace the "
+                    "server instead"
+                )
+            else:
+                probe_failed = False
                 try:
                     server_sync_required = SYNC_REQUIRED_NAMES[
                         self.collection.sync_status(self._sync_auth).required
                     ]
                 except NetworkError:
-                    server_sync_required = None
-            if server_sync_required in {"FULL_SYNC", "FULL_DOWNLOAD", "FULL_UPLOAD"}:
-                warning = (
-                    f"the server requires {server_sync_required}; a normal sync will be refused "
-                    "— use anki_sync_full_upload(force=true) to replace the server"
-                )
-            elif server_sync_required == "NORMAL_SYNC":
-                warning = (
-                    "a normal sync would merge the server's newer changes onto this backup — use "
-                    "anki_sync_full_upload(force=true) to overwrite the server instead"
-                )
-            else:
-                warning = (
-                    "the server still holds its pre-restore state; a normal sync would merge it "
-                    "onto this backup — use anki_sync_full_upload(force=true) to overwrite the "
-                    "server instead"
-                )
+                    probe_failed = True
+                if probe_failed:
+                    warning = (
+                        "the server's state could not be checked; it still holds its pre-restore "
+                        "state — use anki_sync_full_upload(force=true) to replace the server "
+                        "instead of letting a normal sync merge"
+                    )
+                elif server_sync_required in {"FULL_SYNC", "FULL_DOWNLOAD", "FULL_UPLOAD"}:
+                    warning = (
+                        f"the server requires {server_sync_required}; a normal sync will be "
+                        "refused — use anki_sync_full_upload(force=true) to replace the server"
+                    )
+                elif server_sync_required == "NORMAL_SYNC":
+                    warning = (
+                        "a normal sync would merge the server's newer changes onto this backup — "
+                        "use anki_sync_full_upload(force=true) to overwrite the server instead"
+                    )
+                else:
+                    warning = (
+                        "the server reports no changes relative to this backup; a normal sync "
+                        "should be a no-op — use anki_sync_full_upload(force=true) to replace the "
+                        "server anyway"
+                    )
             if target_overwritten:
                 warning = f"{warning}; {overwrite_warning}"
             return {

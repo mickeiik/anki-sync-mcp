@@ -23,6 +23,7 @@ from anki_mcp.collection import (
     AnkiCollectionService,
     CollectionAdapter,
     RestoreFailedError,
+    SyncLoginRequiredError,
 )
 from anki_mcp.config import Settings
 
@@ -195,6 +196,9 @@ def test_local_only_restore_round_trip(tmp_path: Path, monkeypatch: pytest.Monke
             assert result["remote_replaced"] is False
             assert result["target_overwritten"] is False
             assert isinstance(result["warning"], str) and result["warning"]
+            # No sync login in this scenario, so the warning must not claim
+            # knowledge of the server's state.
+            assert "sync login" in result["warning"]
 
             status = await service.status()
             assert status["post_restore_upload_pending"] is True
@@ -752,20 +756,21 @@ def test_backup_listing_returns_newest_first(tmp_path: Path) -> None:
 
     async def scenario() -> None:
         async with AnkiCollectionService(path, max_page_size=100) as service:
-            _rename_backup(await service.create_backup(), "older.colpkg")
+            _rename_backup(await service.create_backup(), "aaa-older.colpkg")
             await service.executor.run(
                 lambda adapter: adapter.create_note(
                     deck_id, note_type_id, {"Front": "B", "Back": "b"}, []
                 )
             )
-            _rename_backup(await service.create_backup(), "newer.colpkg")
-            os.utime(backup_folder / "older.colpkg", (1_000.0, 1_000.0))
-            os.utime(backup_folder / "newer.colpkg", (2_000.0, 2_000.0))
+            _rename_backup(await service.create_backup(), "zzz-newer.colpkg")
+            os.utime(backup_folder / "aaa-older.colpkg", (1_000.0, 1_000.0))
+            os.utime(backup_folder / "zzz-newer.colpkg", (2_000.0, 2_000.0))
             listing = await service.list_backups(0, 10)
             assert listing["total"] == 2
+            # Filename order and mtime order disagree, so this pins the mtime sort.
             assert [item["filename"] for item in listing["items"]] == [
-                "newer.colpkg",
-                "older.colpkg",
+                "zzz-newer.colpkg",
+                "aaa-older.colpkg",
             ]
 
     asyncio.run(scenario())
@@ -819,6 +824,8 @@ def test_failed_restore_raises_restore_failed_and_allows_same_key_retry(
             new_backups = set(backup_folder.glob("*.colpkg")) - before
             assert new_backups
             assert any(str(candidate) in str(first.value) for candidate in new_backups)
+            # The recovery reopen succeeds here, so no restart warning is warranted.
+            assert "must be restarted" not in str(first.value)
             # FIX-2: the failed receipt was deleted, so the same key re-executes
             # instead of replaying a stale ``outcome_unknown`` receipt as success.
             with pytest.raises(RestoreFailedError):
@@ -827,6 +834,87 @@ def test_failed_restore_raises_restore_failed_and_allows_same_key_retry(
                     "restore-key",
                     {"filename": name, "mode": "local_only"},
                     lambda adapter: adapter.restore_backup(name, "local_only"),
+                    sync_after=False,
+                )
+
+    asyncio.run(scenario())
+
+
+def test_failed_restore_with_failed_reopen_warns_to_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, _, _ = _seed_collection(tmp_path)
+    live_path = Path(path)
+    original_import = RustBackend.import_collection_package
+
+    def failing_import(
+        self: RustBackend,
+        *,
+        col_path: str,
+        backup_path: str,
+        media_folder: str,
+        media_db: str,
+    ) -> Any:
+        if Path(col_path) == live_path:
+            raise RuntimeError("injected import failure")
+        return original_import(
+            self,
+            col_path=col_path,
+            backup_path=backup_path,
+            media_folder=media_folder,
+            media_db=media_db,
+        )
+
+    def failing_reopen(self: Collection, after_full_sync: bool = False) -> None:
+        raise RuntimeError("injected reopen failure")
+
+    monkeypatch.setattr(RustBackend, "import_collection_package", failing_import)
+
+    async def scenario() -> None:
+        async with AnkiCollectionService(path, max_page_size=100) as service:
+            name = _rename_backup(await service.create_backup())
+            # Collection.__init__ calls reopen(), so patch only once the service is open.
+            monkeypatch.setattr(Collection, "reopen", failing_reopen)
+            with pytest.raises(RestoreFailedError) as failure:
+                await service.coordinated_mutation(
+                    "anki_backup_restore",
+                    "restart-key",
+                    {"filename": name, "mode": "local_only"},
+                    lambda adapter: adapter.restore_backup(name, "local_only"),
+                    sync_after=False,
+                )
+            assert "must be restarted" in str(failure.value)
+
+    asyncio.run(scenario())
+
+
+def test_upload_now_without_login_does_not_leave_a_replayable_receipt(
+    tmp_path: Path,
+) -> None:
+    path, _, _ = _seed_collection(tmp_path)
+
+    async def scenario() -> None:
+        async with AnkiCollectionService(path, max_page_size=100) as service:
+            name = _rename_backup(await service.create_backup())
+            request = {"filename": name, "mode": "upload_now"}
+            with pytest.raises(SyncLoginRequiredError):
+                await service.coordinated_mutation(
+                    "anki_backup_restore",
+                    "no-login-key",
+                    request,
+                    lambda adapter: adapter.restore_backup(name, "upload_now"),
+                    sync_after=False,
+                )
+            # The predictable failure deletes its receipt, so a same-key replay
+            # executes and fails loudly instead of returning a stale success.
+            with pytest.raises(LookupError):
+                await service.get_operation("no-login-key")
+            with pytest.raises(SyncLoginRequiredError):
+                await service.coordinated_mutation(
+                    "anki_backup_restore",
+                    "no-login-key",
+                    request,
+                    lambda adapter: adapter.restore_backup(name, "upload_now"),
                     sync_after=False,
                 )
 
