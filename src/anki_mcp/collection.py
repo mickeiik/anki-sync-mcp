@@ -2710,6 +2710,38 @@ class CollectionAdapter:
             ),
         }
 
+    def _media_trash_folder(self) -> Path:
+        return Path(self.collection.media.dir()).parent / "media.trash"
+
+    def preview_media_empty_trash(self) -> dict[str, Any]:
+        folder = self._media_trash_folder()
+        entries: list[tuple[str, int]] = []
+        if folder.is_dir():
+            for path in sorted(folder.iterdir(), key=lambda item: item.name):
+                if path.is_file() and not path.is_symlink():
+                    entries.append((path.name, path.stat().st_size))
+        if len(entries) > self.max_search_scan:
+            raise ValueError(
+                "media trash exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
+            )
+        return {
+            "files": len(entries),
+            "bytes": sum(size for _, size in entries),
+            "state_fingerprint": self._impact_fingerprint(
+                [[name, size] for name, size in entries]
+            ),
+        }
+
+    def empty_media_trash(self) -> dict[str, Any]:
+        folder = self._media_trash_folder()
+        count = 0
+        if folder.is_dir():
+            count = sum(
+                1 for path in folder.iterdir() if path.is_file() and not path.is_symlink()
+            )
+        self.collection.media.empty_trash()
+        return {"emptied": True, "files_removed": count}
+
     def check_media(self, offset: int, limit: int) -> dict[str, Any]:
         self._page([], offset, limit)
         response = self.collection.media.check()

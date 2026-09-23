@@ -2033,6 +2033,40 @@ def create_app(settings: Settings) -> ASGIApp:
             sync_media=True,
         )
 
+    @scoped_tool(
+        name="anki_media_empty_trash_preview",
+        scope="destructive",
+        enabled=settings.allow_destructive,
+    )
+    async def media_empty_trash_preview() -> dict[str, Any]:
+        """Preview the trashed media files that will be permanently deleted."""
+        request: dict[str, Any] = {}
+        return await preview(
+            "anki_media_empty_trash", request, lambda adapter: adapter.preview_media_empty_trash()
+        )
+
+    @scoped_tool(
+        name="anki_media_empty_trash",
+        scope="destructive",
+        enabled=settings.allow_destructive,
+    )
+    async def media_empty_trash(
+        confirmation_token: ConfirmationToken,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Permanently delete trashed media after a matching impact preview and required backup."""
+        request: dict[str, Any] = {}
+        return await guarded_mutate(
+            "anki_media_empty_trash",
+            idempotency_key,
+            request,
+            confirmation_token,
+            request,
+            lambda adapter: adapter.preview_media_empty_trash(),
+            lambda adapter: adapter.empty_media_trash(),
+            sync_media=True,
+        )
+
     @scoped_tool(name="anki_export_apkg", scope="read")
     async def export_apkg(
         deck_id: StableId | None = None,

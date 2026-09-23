@@ -108,7 +108,7 @@ receipts, and backups. Preserve the volume across container recreation.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `ANKI_ALLOW_DESTRUCTIVE` | `false` | Registers delete, tag-merge, and FSRS rescheduling preview/apply tools when `MCP_SCOPES` also includes `destructive`. Applying destructive changes requires a preview token and verified fresh backup. |
+| `ANKI_ALLOW_DESTRUCTIVE` | `false` | Registers delete, tag-merge, FSRS rescheduling, and permanent media-trash emptying preview/apply tools when `MCP_SCOPES` also includes `destructive`. Applying destructive changes requires a preview token and verified fresh backup. |
 | `ANKI_ALLOW_FULL_SYNC` | `false` | Registers explicit full-download and full-upload recovery tools. It must also be enabled for schema-changing tools. |
 | `ANKI_ALLOW_RESTORE` | `false` | Registers backup listing and restore tools when `MCP_SCOPES` includes `destructive`; restore additionally requires `ANKI_ALLOW_FULL_SYNC`. Applying a restore requires a preview token and creates a verified pre-restore backup. The restored client must then either overwrite the server (`anki_sync_full_upload(force=true)`) or be reconciled deliberately, because a normal sync would merge the server's pre-restore state onto the restored backup. |
 | `ANKI_ALLOW_SCHEMA_CHANGES` | `false` | Registers note-type and template mutation tools when `ANKI_ALLOW_FULL_SYNC` is also enabled. Note-type deletion additionally requires destructive access. |
