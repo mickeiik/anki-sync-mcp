@@ -2137,7 +2137,12 @@ def create_app(settings: Settings) -> ASGIApp:
         tags: Tags | None = None,
         dupe_resolution: CsvDupeResolution = "preserve",
     ) -> dict[str, Any]:
-        """Import a staged .csv into a note type and deck after a matching preview token."""
+        """Import a staged .csv into a note type and deck after a matching preview token.
+
+        The preview token binds the file identity (content digest) and delimiter; the
+        note type, field mapping, deck, tags, and duplicate resolution are chosen at
+        apply time. The same authenticated caller must perform both preview and apply.
+        """
         normalized_tags = tags or []
         request = {
             "filename": filename,
@@ -2170,7 +2175,8 @@ def create_app(settings: Settings) -> ASGIApp:
 
     @scoped_tool(name="anki_undo_status", scope="read")
     async def undo_status() -> dict[str, Any]:
-        """Report the in-memory undo and redo stack heads for the running collection process."""
+        """Report the in-memory undo and redo stack heads and, when undo/redo are not
+        registered, the reason (for example while ANKI_SYNC_ON_WRITE is enabled)."""
         result = await execute(service.coordinated_read(lambda adapter: adapter.undo_status()))
         if not isinstance(result, dict):  # pragma: no cover - adapter always returns a mapping
             raise RuntimeError("undo status returned an invalid result")

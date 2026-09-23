@@ -52,6 +52,15 @@ async def _export_fixtures(path: str, deck_id: int) -> tuple[dict, dict]:
     return apkg, csv
 
 
+async def _field_tuples(service: AnkiCollectionService) -> set[tuple[str, ...]]:
+    """Return every note's full field tuple (all fields, in order)."""
+    searched = await service.search_notes("", 0, 100)
+    return {
+        tuple(field["value"] for field in (await service.get_note(item["id"]))["fields"])
+        for item in searched["items"]
+    }
+
+
 @pytest.fixture
 def source_collection(tmp_path: Path) -> Iterator[tuple[str, int]]:
     source = tmp_path / "source" / "collection.anki2"
@@ -157,6 +166,24 @@ async def test_preview_apkg_rejects_corrupt_and_missing_members(tmp_path: Path) 
             await service.preview_import_apkg("tampered.apkg")
 
 
+@pytest.mark.anyio
+async def test_preview_apkg_rejects_declared_uncompressed_bomb(tmp_path: Path) -> None:
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+    imports = _imports_dir(target)
+    with zipfile.ZipFile(imports / "bomb.apkg", "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("meta", "{}")
+        archive.writestr("collection.anki2", b"\0" * 2_000_000)
+
+    async with AnkiCollectionService(
+        str(target), max_page_size=100, max_import_bytes=65_536
+    ) as service:
+        # The compressed file is tiny; only the declared uncompressed size trips the cap.
+        with pytest.raises(ResourceLimitError, match="ANKI_MAX_IMPORT_BYTES"):
+            await service.preview_import_apkg("bomb.apkg")
+
+
 # --------------------------------------------------------------------------------------
 # round trips
 # --------------------------------------------------------------------------------------
@@ -180,10 +207,12 @@ async def test_apkg_round_trip(source_collection: tuple[str, int], tmp_path: Pat
 
         result = await service.import_apkg("fixture.apkg", True, 2, 2, True, False)
         searched = await service.search_notes("", 0, 100)
+        field_tuples = await _field_tuples(service)
 
     assert result["notes_added"] == 2
     assert result["notes_found"] == 2
     assert {note["first_field"] for note in searched["items"]} == {"front-a1", "front-a2"}
+    assert field_tuples == {("front-a1", "back-a1"), ("front-a2", "back-a2")}
 
 
 @pytest.mark.anyio
@@ -215,6 +244,7 @@ async def test_csv_round_trip(source_collection: tuple[str, int], tmp_path: Path
         )
         searched = await service.search_notes("", 0, 100)
         cards = await service.search_cards("", 0, 100)
+        field_tuples = await _field_tuples(service)
 
     assert result["notes_added"] == 2
     assert result["notes_found"] == 2
@@ -222,6 +252,7 @@ async def test_csv_round_trip(source_collection: tuple[str, int], tmp_path: Path
         "front-a1",
         "front-a2",
     }
+    assert field_tuples == {("front-a1", "back-a1"), ("front-a2", "back-a2")}
     assert cards["total"] == 2
 
 
@@ -253,6 +284,91 @@ async def test_csv_field_columns_must_map_every_field(
             await service.import_csv(
                 "fixture.csv", notetype_id, [1, 2], 1, "\t", True, [], "bogus"
             )
+
+
+@pytest.mark.anyio
+async def test_csv_field_columns_reject_out_of_range_and_duplicates(
+    source_collection: tuple[str, int], tmp_path: Path
+) -> None:
+    source, deck_id = source_collection
+    _, csv = await _export_fixtures(source, deck_id)
+
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+    imports = _imports_dir(target)
+    shutil.copy2(csv["path"], imports / "fixture.csv")
+
+    collection = Collection(str(target))
+    try:
+        notetype_id = int(collection.models.by_name("Basic")["id"])
+    finally:
+        collection.close()
+
+    async with AnkiCollectionService(str(target), max_page_size=100) as service:
+        # The exported CSV has three columns; index 5 is out of range.
+        with pytest.raises(ValueError, match="outside the"):
+            await service.import_csv(
+                "fixture.csv", notetype_id, [1, 5], 1, "\t", True, [], "preserve"
+            )
+        # Two fields cannot map to the same non-zero column.
+        with pytest.raises(ValueError, match="same column"):
+            await service.import_csv(
+                "fixture.csv", notetype_id, [1, 1], 1, "\t", True, [], "preserve"
+            )
+
+
+@pytest.mark.anyio
+async def test_csv_reports_first_field_matches(tmp_path: Path) -> None:
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+    imports = _imports_dir(target)
+    (imports / "first.csv").write_text("front-a1\tback-a1\nfront-a2\tback-a2\n")
+    (imports / "second.csv").write_text("front-a1\tchanged\n")
+
+    collection = Collection(str(target))
+    try:
+        notetype_id = int(collection.models.by_name("Basic")["id"])
+    finally:
+        collection.close()
+
+    async with AnkiCollectionService(str(target), max_page_size=100) as service:
+        first = await service.import_csv(
+            "first.csv", notetype_id, [1, 2], 1, "\t", None, [], "preserve"
+        )
+        second = await service.import_csv(
+            "second.csv", notetype_id, [1, 2], 1, "\t", None, [], "preserve"
+        )
+
+    assert first["notes_added"] == 2
+    # The second row matches an existing note by first field only.
+    assert second["notes_added"] == 0
+    assert second["notes_matched_first_field"] == 1
+    assert first["notes_matched_first_field"] == 0
+
+
+@pytest.mark.anyio
+async def test_import_apkg_rejects_file_swapped_after_preview(
+    source_collection: tuple[str, int], tmp_path: Path
+) -> None:
+    source, deck_id = source_collection
+    apkg, _ = await _export_fixtures(source, deck_id)
+
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+    imports = _imports_dir(target)
+    staged = imports / "fixture.apkg"
+    shutil.copy2(apkg["path"], staged)
+
+    async with AnkiCollectionService(str(target), max_page_size=100) as service:
+        preview = await service.preview_import_apkg("fixture.apkg")
+        assert preview["validated"] is True
+
+        staged.write_bytes(b"not a zip archive")
+        with pytest.raises(ValueError, match="valid zip archive"):
+            await service.import_apkg("fixture.apkg", True, 2, 2, True, False)
 
 
 # --------------------------------------------------------------------------------------
@@ -326,6 +442,15 @@ def test_import_tools_require_flags_and_destructive_scope(tmp_path: Path) -> Non
 
     full = _tool_names(path, allow_import=True, allow_schema=True, allow_full_sync=True)
     assert gated <= set(full)
+
+    # apkg tools require all three flags; each missing flag hides them independently.
+    no_full_sync = _tool_names(path, allow_import=True, allow_schema=True, allow_full_sync=False)
+    assert {"anki_import_csv_preview", "anki_import_csv"} <= set(no_full_sync)
+    assert not ({"anki_import_apkg_preview", "anki_import_apkg"} & set(no_full_sync))
+
+    no_schema = _tool_names(path, allow_import=True, allow_schema=False, allow_full_sync=True)
+    assert {"anki_import_csv_preview", "anki_import_csv"} <= set(no_schema)
+    assert not ({"anki_import_apkg_preview", "anki_import_apkg"} & set(no_schema))
 
     no_scope = _tool_names(path, allow_import=True, scopes="read,write,admin")
     assert "anki_import_files_list" in no_scope
@@ -512,8 +637,116 @@ def test_app_csv_import_token_flow_replay_and_backup(
         replayed = _payload(_call(client, headers, 4, "anki_import_csv", arguments))
         assert replayed == applied
 
+        # Re-preview and replay the same key with a fresh token: the stored receipt is
+        # returned and no second import happens.
+        fresh_preview = _payload(
+            _call(client, headers, 5, "anki_import_csv_preview", {"filename": "fixture.csv"})
+        )
+        replayed_with_fresh_token = _payload(
+            _call(
+                client,
+                headers,
+                6,
+                "anki_import_csv",
+                {**arguments, "confirmation_token": fresh_preview["confirmation_token"]},
+            )
+        )
+        assert replayed_with_fresh_token == applied
+
+        listed = _payload(_call(client, headers, 7, "anki_notes_search", {"query": ""}))
+        assert listed["total"] == 2
+
     collection = Collection(str(target))
     try:
         assert collection.note_count() == 2
     finally:
         collection.close()
+
+
+def test_app_csv_import_rejects_tail_rewrite_past_sample(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+    imports = _imports_dir(target)
+    staged = imports / "fixture.csv"
+    rows = "\n".join(f"front-{index}\tback-{index}" for index in range(600))
+    staged.write_text(rows + "\n")
+
+    collection = Collection(str(target))
+    try:
+        notetype_id = int(collection.models.by_name("Basic")["id"])
+    finally:
+        collection.close()
+
+    settings = _import_settings(target, monkeypatch)
+    with TestClient(create_app(settings)) as client:
+        headers = _initialize(client)
+        preview = _payload(
+            _call(client, headers, 2, "anki_import_csv_preview", {"filename": "fixture.csv"})
+        )
+
+        # Rewrite a byte past the 4096-byte sample while keeping the file length.
+        original = bytearray(staged.read_bytes())
+        assert len(original) > 4096
+        original[-2] = ord("X") if original[-2] != ord("X") else ord("Y")
+        staged.write_bytes(bytes(original))
+        assert len(staged.read_bytes()) == len(original)
+
+        refused = _call(
+            client,
+            headers,
+            3,
+            "anki_import_csv",
+            {
+                "filename": "fixture.csv",
+                "notetype_id": notetype_id,
+                "field_columns": [1, 2],
+                "deck_id": 1,
+                "confirmation_token": preview["confirmation_token"],
+                "idempotency_key": "csv-tail-1",
+            },
+        )
+        assert refused.get("isError") is True
+        assert "DESTRUCTIVE_CONFIRMATION_REQUIRED" in refused["content"][0]["text"]
+
+    assert Collection(str(target)).note_count() == 0
+
+
+def test_app_apkg_predictable_file_failure_is_invalid_argument(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+    imports = _imports_dir(target)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("meta", "")
+        archive.writestr("collection.anki2", b"collection-bytes")
+    (imports / "emptymeta.apkg").write_bytes(buffer.getvalue())
+
+    settings = _import_settings(target, monkeypatch)
+    with TestClient(create_app(settings)) as client:
+        headers = _initialize(client)
+        # The empty meta passes preview validation but fails predictably at import.
+        preview = _payload(
+            _call(client, headers, 2, "anki_import_apkg_preview", {"filename": "emptymeta.apkg"})
+        )
+        arguments = {
+            "filename": "emptymeta.apkg",
+            "confirmation_token": preview["confirmation_token"],
+            "idempotency_key": "apkg-bad-1",
+        }
+        failed = _call(client, headers, 3, "anki_import_apkg", arguments)
+        assert failed.get("isError") is True
+        assert "INVALID_ARGUMENT" in failed["content"][0]["text"]
+
+        # The receipt was deleted, so the replay is refused again rather than
+        # returning a stale "committed" outcome.
+        replay = _call(client, headers, 4, "anki_import_apkg", arguments)
+        assert replay.get("isError") is True
+        assert "DESTRUCTIVE_CONFIRMATION_REQUIRED" in replay["content"][0]["text"]
+
+    assert Collection(str(target)).note_count() == 0

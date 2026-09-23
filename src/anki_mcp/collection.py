@@ -28,7 +28,14 @@ from anki.collection import AddNoteRequest, Collection, DeckIdLimit
 from anki.config_pb2 import ConfigKey
 from anki.consts import CARD_TYPE_REV, QUEUE_TYPE_SUSPENDED
 from anki.decks import UpdateDeckConfigs
-from anki.errors import InvalidInput, NetworkError, NotFoundError, SearchError, UndoEmpty
+from anki.errors import (
+    BackendError,
+    InvalidInput,
+    NetworkError,
+    NotFoundError,
+    SearchError,
+    UndoEmpty,
+)
 from anki.import_export_pb2 import (
     CsvMetadata,
     ExportAnkiPackageOptions,
@@ -161,6 +168,10 @@ class IdempotencyConflictError(ValueError):
 
 class ResourceLimitError(ValueError):
     """Raised when a bounded operation proves its configured work limit was exceeded."""
+
+
+class ImportFileError(ValueError):
+    """Raised when a staged import file cannot be read or validated as expected."""
 
 
 class MediaSyncFailedError(TimeoutError):
@@ -3501,16 +3512,29 @@ class CollectionAdapter:
             raise ValueError("apkg import requires a .apkg file")
         try:
             with ZipFile(path) as archive:
-                members = set(archive.namelist())
+                infos = archive.infolist()
+                # Reject declared zip bombs before testzip() inflates every member.
+                declared_size = sum(info.file_size for info in infos)
+                if declared_size > self.max_import_bytes:
+                    raise ResourceLimitError(
+                        f"import {filename} declares uncompressed content larger than "
+                        f"ANKI_MAX_IMPORT_BYTES ({self.max_import_bytes})"
+                    )
+                members = {info.filename for info in infos}
                 if archive.testzip() is not None:
                     raise ValueError("import package failed its integrity check")
+            if "meta" not in members or not members & {
+                "collection.anki21b",
+                "collection.anki2",
+            }:
+                raise ValueError("import package is missing required collection members")
+            stat = path.stat()
+            with path.open("rb") as handle:
+                digest = hashlib.file_digest(handle, "sha256").hexdigest()
         except BadZipFile as exc:
             raise ValueError("import package is not a valid zip archive") from exc
-        if "meta" not in members or not members & {"collection.anki21b", "collection.anki2"}:
-            raise ValueError("import package is missing required collection members")
-        stat = path.stat()
-        with path.open("rb") as handle:
-            digest = hashlib.file_digest(handle, "sha256").hexdigest()
+        except (BackendError, OSError, UnicodeDecodeError) as exc:
+            raise ImportFileError(f"staged import file could not be read: {exc}") from exc
         return {
             "filename": filename,
             "size_bytes": stat.st_size,
@@ -3528,20 +3552,23 @@ class CollectionAdapter:
         with_deck_configs: bool,
     ) -> dict[str, Any]:
         path = self._import_path(filename, require_exists=True)
-        # Re-validate the archive so a file swapped after preview cannot be imported.
-        self.preview_import_apkg_file(filename)
-        response = self.collection.import_anki_package(
-            ImportAnkiPackageRequest(
-                package_path=str(path),
-                options=ImportAnkiPackageOptions(
-                    merge_notetypes=merge_notetypes,
-                    update_notes=update_notes,
-                    update_notetypes=update_notetypes,
-                    with_scheduling=with_scheduling,
-                    with_deck_configs=with_deck_configs,
-                ),
+        try:
+            # Re-validate the archive so a file swapped after preview cannot be imported.
+            self.preview_import_apkg_file(filename)
+            response = self.collection.import_anki_package(
+                ImportAnkiPackageRequest(
+                    package_path=str(path),
+                    options=ImportAnkiPackageOptions(
+                        merge_notetypes=merge_notetypes,
+                        update_notes=update_notes,
+                        update_notetypes=update_notetypes,
+                        with_scheduling=with_scheduling,
+                        with_deck_configs=with_deck_configs,
+                    ),
+                )
             )
-        )
+        except (BackendError, OSError, UnicodeDecodeError) as exc:
+            raise ImportFileError(f"staged import file could not be read: {exc}") from exc
         log = response.log
         return {
             "filename": filename,
@@ -3549,6 +3576,7 @@ class CollectionAdapter:
             "notes_updated": len(log.updated),
             "notes_duplicate": len(log.duplicate),
             "notes_conflicting": len(log.conflicting),
+            "notes_matched_first_field": len(log.first_field_match),
             "notes_found": int(log.found_notes),
             "merge_notetypes": merge_notetypes,
             "update_notes": update_notes,
@@ -3588,20 +3616,43 @@ class CollectionAdapter:
         if path.suffix != ".csv":
             raise ValueError("csv import requires a .csv file")
         delimiter_value = self._csv_delimiter(delimiter)
-        metadata = self.collection.get_csv_metadata(str(path), delimiter_value)
-        effective = (
-            delimiter
-            if delimiter is not None
-            else CSV_DELIMITER_NAMES.get(int(metadata.delimiter), "\t")
-        )
+        try:
+            metadata = self.collection.get_csv_metadata(str(path), delimiter_value)
+            effective = (
+                delimiter
+                if delimiter is not None
+                else CSV_DELIMITER_NAMES.get(int(metadata.delimiter), "\t")
+            )
+            stat = path.stat()
+            with path.open("rb") as handle:
+                digest = hashlib.file_digest(handle, "sha256").hexdigest()
+            sample_rows = self._csv_sample_rows(path, effective)
+        except (BackendError, OSError, UnicodeDecodeError) as exc:
+            raise ImportFileError(f"staged import file could not be read: {exc}") from exc
         return {
             "filename": filename,
-            "size_bytes": path.stat().st_size,
+            "size_bytes": stat.st_size,
+            "sha256": digest,
             "delimiter": effective,
             "is_html": bool(metadata.is_html),
             "column_labels": list(metadata.column_labels),
-            "sample_rows": self._csv_sample_rows(path, effective),
+            "sample_rows": sample_rows,
         }
+
+    @staticmethod
+    def _validate_field_columns(
+        field_columns: Sequence[int], metadata: CsvMetadata, filename: str
+    ) -> None:
+        column_count = len(metadata.column_labels)
+        for column in field_columns:
+            if column < 0 or column > column_count:
+                raise ValueError(
+                    f"field_columns entry {column} is outside the {column_count} "
+                    f"columns of {filename}"
+                )
+        nonzero = [column for column in field_columns if column != 0]
+        if len(nonzero) != len(set(nonzero)):
+            raise ValueError("field_columns must not map more than one field to the same column")
 
     def import_csv(
         self,
@@ -3614,37 +3665,49 @@ class CollectionAdapter:
         tags: Sequence[str],
         dupe_resolution: str,
     ) -> dict[str, Any]:
-        path = self._import_path(filename, require_exists=True)
-        if path.suffix != ".csv":
-            raise ValueError("csv import requires a .csv file")
-        model = self.collection.models.get(cast("NotetypeId", notetype_id))
-        if model is None:
-            raise LookupError(f"note type {notetype_id} not found")
-        field_count = len(model["flds"])
-        if len(field_columns) != field_count:
-            raise ValueError(
-                f"field_columns must map every field of note type {notetype_id} "
-                f"({field_count} fields, got {len(field_columns)})"
-            )
-        self.get_deck(deck_id)
         try:
-            dupe_value = CSV_DUPE_RESOLUTIONS[dupe_resolution]
-        except KeyError as exc:
-            raise ValueError("dupe_resolution must be preserve, update, or duplicate") from exc
-        delimiter_value = self._csv_delimiter(delimiter)
-        metadata = self.collection.get_csv_metadata(str(path), delimiter_value)
-        if delimiter_value is not None:
-            metadata.delimiter = delimiter_value
-        metadata.global_notetype.id = notetype_id
-        del metadata.global_notetype.field_columns[:]
-        metadata.global_notetype.field_columns.extend(field_columns)
-        metadata.deck_id = deck_id
-        if is_html is not None:
-            metadata.is_html = is_html
-        del metadata.global_tags[:]
-        metadata.global_tags.extend(tags)
-        metadata.dupe_resolution = dupe_value
-        response = self.collection.import_csv(ImportCsvRequest(path=str(path), metadata=metadata))
+            path = self._import_path(filename, require_exists=True)
+            if path.suffix != ".csv":
+                raise ValueError("csv import requires a .csv file")
+            # Belt-and-braces: re-validate the staged file (and recompute its content
+            # digest) immediately before the backend import. The preview token binds
+            # the digest through the guarded impact; this narrows the swap window.
+            self.preview_import_csv(filename, delimiter)
+            model = self.collection.models.get(cast("NotetypeId", notetype_id))
+            if model is None:
+                raise LookupError(f"note type {notetype_id} not found")
+            field_count = len(model["flds"])
+            if len(field_columns) != field_count:
+                raise ValueError(
+                    f"field_columns must map every field of note type {notetype_id} "
+                    f"({field_count} fields, got {len(field_columns)})"
+                )
+            self.get_deck(deck_id)
+            try:
+                dupe_value = CSV_DUPE_RESOLUTIONS[dupe_resolution]
+            except KeyError as exc:
+                raise ValueError(
+                    "dupe_resolution must be preserve, update, or duplicate"
+                ) from exc
+            delimiter_value = self._csv_delimiter(delimiter)
+            metadata = self.collection.get_csv_metadata(str(path), delimiter_value)
+            if delimiter_value is not None:
+                metadata.delimiter = delimiter_value
+            self._validate_field_columns(field_columns, metadata, filename)
+            metadata.global_notetype.id = notetype_id
+            del metadata.global_notetype.field_columns[:]
+            metadata.global_notetype.field_columns.extend(field_columns)
+            metadata.deck_id = deck_id
+            if is_html is not None:
+                metadata.is_html = is_html
+            del metadata.global_tags[:]
+            metadata.global_tags.extend(tags)
+            metadata.dupe_resolution = dupe_value
+            response = self.collection.import_csv(
+                ImportCsvRequest(path=str(path), metadata=metadata)
+            )
+        except (BackendError, OSError, UnicodeDecodeError) as exc:
+            raise ImportFileError(f"staged import file could not be read: {exc}") from exc
         log = response.log
         return {
             "filename": filename,
@@ -3654,6 +3717,7 @@ class CollectionAdapter:
             "notes_updated": len(log.updated),
             "notes_duplicate": len(log.duplicate),
             "notes_conflicting": len(log.conflicting),
+            "notes_matched_first_field": len(log.first_field_match),
             "notes_found": int(log.found_notes),
         }
 
