@@ -37,6 +37,7 @@ from anki_mcp.collection import (
     IdempotencyConflictError,
     MediaSyncFailedError,
     ResourceLimitError,
+    RestoreFailedError,
     SyncLoginRequiredError,
 )
 from anki_mcp.config import Settings
@@ -548,6 +549,8 @@ def create_app(settings: Settings) -> ASGIApp:
                 exc,
                 log_cause=True,
             )
+        except RestoreFailedError as exc:
+            raise_tool_error("RESTORE_FAILED", str(exc), exc)
         except UndoEmpty as exc:
             raise_tool_error("UNDO_UNAVAILABLE", str(exc), exc)
         except ResponseTooLargeError as exc:

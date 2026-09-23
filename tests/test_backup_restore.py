@@ -13,11 +13,17 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from anki._backend import RustBackend
 from anki.collection import Collection
+from anki.sync import SyncAuth
 from starlette.testclient import TestClient
 
 from anki_mcp.app import create_app
-from anki_mcp.collection import AnkiCollectionService, CollectionAdapter
+from anki_mcp.collection import (
+    AnkiCollectionService,
+    CollectionAdapter,
+    RestoreFailedError,
+)
 from anki_mcp.config import Settings
 
 
@@ -187,6 +193,7 @@ def test_local_only_restore_round_trip(tmp_path: Path, monkeypatch: pytest.Monke
             assert result["restored"] is True
             assert result["mode"] == "local_only"
             assert result["remote_replaced"] is False
+            assert result["target_overwritten"] is False
             assert isinstance(result["warning"], str) and result["warning"]
 
             status = await service.status()
@@ -234,6 +241,7 @@ def test_restore_uses_previewed_content_when_target_is_replaced_during_apply(
 
             result = await service.restore_backup(target_name, "local_only")
             assert result["restored"] is True
+            assert result["target_overwritten"] is True
             assert Path(str(result["backup"]["path"])).is_file()
 
             listing = await service.coordinated_read(
@@ -512,6 +520,9 @@ def test_upload_now_replaces_server_in_one_call(
             result = await service.restore_backup(name, "upload_now")
             assert result["restored"] is True
             assert result["remote_replaced"] is True
+            assert result["media_sync_required"] is True
+            assert isinstance(result["warning"], str)
+            assert "anki_sync(sync_media=true)" in result["warning"]
             assert (await service.status())["post_restore_upload_pending"] is False
 
     asyncio.run(restore_and_upload())
@@ -532,3 +543,291 @@ def test_upload_now_replaces_server_in_one_call(
             assert _fronts(listing) == {"A"}
 
     asyncio.run(verify_download())
+
+
+class _StubSyncOutput:
+    """Minimal stand-in for the protobuf fields ``CollectionAdapter.sync`` reads."""
+
+    def __init__(self, required: int) -> None:
+        self.required = required
+        self.server_media_usn = None
+        self.new_endpoint = ""
+        self.server_message = ""
+        self.host_number = 0
+
+
+class _StubSyncStatus:
+    def __init__(self, required: int) -> None:
+        self.required = required
+
+
+def _post_restore_status(path: str) -> bool:
+    status = json.loads(
+        (Path(path).parent / "state" / "operation-status.json").read_text(encoding="utf-8")
+    )
+    return bool(status["post_restore_upload"])
+
+
+def _tool_names_for(settings: Settings) -> set[str]:
+    headers = {
+        "Authorization": "Bearer restore-token",
+        "Accept": "application/json, text/event-stream",
+    }
+    with TestClient(create_app(settings)) as client:
+        initialized = client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "pytest", "version": "1"},
+                },
+            },
+        )
+        headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+        listed = client.post(
+            "/mcp",
+            headers=headers,
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        )
+    return {tool["name"] for tool in listed.json()["result"]["tools"]}
+
+
+def test_restore_tools_require_both_restore_and_full_sync_gates(
+    restore_settings: tuple[Settings, int, int],
+) -> None:
+    settings, _, _ = restore_settings
+    restore_tools = {"anki_backup_restore_preview", "anki_backup_restore"}
+    assert restore_tools <= _tool_names_for(settings)
+    restore_only = settings.model_copy(update={"allow_restore": True, "allow_full_sync": False})
+    assert not (restore_tools & _tool_names_for(restore_only))
+    full_only = settings.model_copy(update={"allow_restore": False, "allow_full_sync": True})
+    assert not (restore_tools & _tool_names_for(full_only))
+
+
+def test_force_gating_for_full_upload(official_sync_server: str, tmp_path: Path) -> None:
+    path, _, _ = _seed_collection(tmp_path)
+
+    async def scenario() -> None:
+        async with AnkiCollectionService(path, max_page_size=100) as service:
+            await service.sync_login("phase1-user", "phase1-password", official_sync_server)
+            with pytest.raises(ValueError, match="no post-restore upload is pending"):
+                await service.full_sync(upload=True, force=True)
+            with pytest.raises(ValueError, match="force is only supported for a full upload"):
+                await service.full_sync(upload=False, force=True)
+
+    asyncio.run(scenario())
+
+
+def test_post_restore_window_persists_across_service_restart(
+    official_sync_server: str, tmp_path: Path
+) -> None:
+    path, _, _ = _seed_collection(tmp_path)
+
+    async def restore_on_first_service() -> None:
+        async with AnkiCollectionService(path, max_page_size=100) as service:
+            created = await service.create_backup()
+            name = _rename_backup(created)
+            await service.sync_login("phase1-user", "phase1-password", official_sync_server)
+            result = await service.restore_backup(name, "local_only")
+            assert result["restored"] is True
+            assert (await service.status())["post_restore_upload_pending"] is True
+
+    asyncio.run(restore_on_first_service())
+
+    async def verify_on_second_service() -> None:
+        async with AnkiCollectionService(path, max_page_size=100) as service:
+            assert (await service.status())["post_restore_upload_pending"] is True
+            forced = await service.full_sync(upload=True, force=True)
+            assert forced["direction"] == "upload"
+            assert (await service.status())["post_restore_upload_pending"] is False
+
+    asyncio.run(verify_on_second_service())
+
+
+def test_restore_clears_pending_full_sync(official_sync_server: str, tmp_path: Path) -> None:
+    path, _, _ = _seed_collection(tmp_path)
+
+    async def scenario() -> None:
+        async with AnkiCollectionService(path, max_page_size=100) as service:
+            created = await service.create_backup()
+            name = _rename_backup(created)
+            await service.sync_login("phase1-user", "phase1-password", official_sync_server)
+            required = (await service.sync(sync_media=False))["required"]
+            assert required in {"FULL_SYNC", "FULL_UPLOAD"}
+            assert (await service.status())["pending_full_sync"] == required
+            await service.restore_backup(name, "local_only")
+            assert (await service.status())["pending_full_sync"] is None
+
+    asyncio.run(scenario())
+
+
+def test_post_restore_window_clears_on_normal_sync_and_non_forced_full_sync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, _, _ = _seed_collection(tmp_path)
+
+    async def scenario() -> None:
+        async with AnkiCollectionService(path, max_page_size=100) as service:
+            created = await service.create_backup()
+            name = _rename_backup(created)
+            monkeypatch.setattr(Collection, "sync_status", lambda self, auth: _StubSyncStatus(0))
+            await service.executor.run(
+                lambda adapter: setattr(adapter, "_sync_auth", SyncAuth(hkey="stub"))
+            )
+            monkeypatch.setattr(
+                Collection, "sync_collection", lambda self, auth, sync_media: _StubSyncOutput(0)
+            )
+
+            assert (await service.restore_backup(name, "local_only"))["restored"] is True
+            assert (await service.status())["post_restore_upload_pending"] is True
+            await service.sync(sync_media=False)
+            assert (await service.status())["post_restore_upload_pending"] is False
+            assert _post_restore_status(path) is False
+
+            # FIX-3: a non-forced full sync must clear the window too.
+            assert (await service.restore_backup(name, "local_only"))["restored"] is True
+            assert (await service.status())["post_restore_upload_pending"] is True
+            monkeypatch.setattr(
+                Collection, "sync_collection", lambda self, auth, sync_media: _StubSyncOutput(3)
+            )
+            await service.sync(sync_media=False)
+            assert (await service.status())["pending_full_sync"] == "FULL_DOWNLOAD"
+            assert (await service.status())["post_restore_upload_pending"] is True
+            monkeypatch.setattr(Collection, "full_upload_or_download", lambda self, **kwargs: None)
+            result = await service.full_sync(upload=False, force=False)
+            assert result["direction"] == "download"
+            assert (await service.status())["post_restore_upload_pending"] is False
+            assert _post_restore_status(path) is False
+
+    asyncio.run(scenario())
+
+
+def test_upload_now_reconciles_pending_receipts(
+    official_sync_server: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, note_type_id, deck_id = _seed_collection(tmp_path)
+    calls = {"count": 0}
+
+    def flaky_sync(self: CollectionAdapter, sync_media: bool) -> dict[str, Any]:
+        calls["count"] += 1
+        if calls["count"] >= 2:
+            raise RuntimeError("post-sync failed")
+        return {"required": "NO_CHANGES"}
+
+    monkeypatch.setattr(CollectionAdapter, "_sync_or_raise_full_sync", flaky_sync)
+
+    async def scenario() -> None:
+        async with AnkiCollectionService(path, max_page_size=100, sync_on_write=True) as service:
+            created = await service.create_backup()
+            name = _rename_backup(created)
+            receipt = await service.coordinated_mutation(
+                "anki_notes_create",
+                "pending-key",
+                {"front": "B"},
+                lambda adapter: adapter.create_note(
+                    deck_id, note_type_id, {"Front": "B", "Back": "b"}, []
+                ),
+                sync_media=True,
+            )
+            assert receipt["remote_synced"] is False
+            assert receipt["retryable"] is True
+            await service.sync_login("phase1-user", "phase1-password", official_sync_server)
+            result = await service.restore_backup(name, "upload_now")
+            assert result["remote_replaced"] is True
+            operation = await service.get_operation("pending-key")
+            assert operation["receipt"]["remote_synced"] is True
+            assert operation["receipt"]["state"] == "committed"
+
+    asyncio.run(scenario())
+
+
+def test_backup_listing_returns_newest_first(tmp_path: Path) -> None:
+    path, note_type_id, deck_id = _seed_collection(tmp_path)
+    backup_folder = Path(path).parent / "backups"
+
+    async def scenario() -> None:
+        async with AnkiCollectionService(path, max_page_size=100) as service:
+            _rename_backup(await service.create_backup(), "older.colpkg")
+            await service.executor.run(
+                lambda adapter: adapter.create_note(
+                    deck_id, note_type_id, {"Front": "B", "Back": "b"}, []
+                )
+            )
+            _rename_backup(await service.create_backup(), "newer.colpkg")
+            os.utime(backup_folder / "older.colpkg", (1_000.0, 1_000.0))
+            os.utime(backup_folder / "newer.colpkg", (2_000.0, 2_000.0))
+            listing = await service.list_backups(0, 10)
+            assert listing["total"] == 2
+            assert [item["filename"] for item in listing["items"]] == [
+                "newer.colpkg",
+                "older.colpkg",
+            ]
+
+    asyncio.run(scenario())
+
+
+def test_failed_restore_raises_restore_failed_and_allows_same_key_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, note_type_id, deck_id = _seed_collection(tmp_path)
+    backup_folder = Path(path).parent / "backups"
+    live_path = Path(path)
+    original_import = RustBackend.import_collection_package
+
+    def failing_import(
+        self: RustBackend,
+        *,
+        col_path: str,
+        backup_path: str,
+        media_folder: str,
+        media_db: str,
+    ) -> Any:
+        if Path(col_path) == live_path:
+            raise RuntimeError("injected import failure")
+        return original_import(
+            self,
+            col_path=col_path,
+            backup_path=backup_path,
+            media_folder=media_folder,
+            media_db=media_db,
+        )
+
+    monkeypatch.setattr(RustBackend, "import_collection_package", failing_import)
+
+    async def scenario() -> None:
+        async with AnkiCollectionService(path, max_page_size=100) as service:
+            name = _rename_backup(await service.create_backup())
+            await service.executor.run(
+                lambda adapter: adapter.create_note(
+                    deck_id, note_type_id, {"Front": "B", "Back": "b"}, []
+                )
+            )
+            before = set(backup_folder.glob("*.colpkg"))
+            with pytest.raises(RestoreFailedError) as first:
+                await service.coordinated_mutation(
+                    "anki_backup_restore",
+                    "restore-key",
+                    {"filename": name, "mode": "local_only"},
+                    lambda adapter: adapter.restore_backup(name, "local_only"),
+                    sync_after=False,
+                )
+            new_backups = set(backup_folder.glob("*.colpkg")) - before
+            assert new_backups
+            assert any(str(candidate) in str(first.value) for candidate in new_backups)
+            # FIX-2: the failed receipt was deleted, so the same key re-executes
+            # instead of replaying a stale ``outcome_unknown`` receipt as success.
+            with pytest.raises(RestoreFailedError):
+                await service.coordinated_mutation(
+                    "anki_backup_restore",
+                    "restore-key",
+                    {"filename": name, "mode": "local_only"},
+                    lambda adapter: adapter.restore_backup(name, "local_only"),
+                    sync_after=False,
+                )
+
+    asyncio.run(scenario())

@@ -135,6 +135,10 @@ class BackupFailedError(RuntimeError):
     """Raised when a guarded mutation cannot obtain a verified current backup."""
 
 
+class RestoreFailedError(RuntimeError):
+    """Raised when applying a backup fails and the live collection may be unusable."""
+
+
 class CollectionAdapter:
     """Synchronous adapter; an instance must only be used by its owning thread."""
 
@@ -412,19 +416,6 @@ class CollectionAdapter:
             raise LookupError(f"backup {filename} not found")
         return path
 
-    def _newest_valid_backup(self) -> Path | None:
-        candidates = [
-            path
-            for path in self._backup_folder.glob("*.colpkg")
-            if path.is_file() and not path.is_symlink()
-        ]
-        for candidate in sorted(
-            candidates, key=lambda item: item.stat().st_mtime_ns, reverse=True
-        ):
-            if self._is_valid_backup(candidate):
-                return candidate
-        return None
-
     def preview_backup_restore(self, filename: str) -> dict[str, Any]:
         """Validate a named backup and report the impact of restoring it."""
         path = self._backup_path(filename, require_exists=True)
@@ -463,11 +454,28 @@ class CollectionAdapter:
         with TemporaryDirectory(prefix="anki-mcp-restore-") as temporary:
             snapshot = Path(temporary) / "target.colpkg"
             shutil.copy2(path, snapshot)
+            target_before = path.stat()
             backup = self.create_backup()
             if not isinstance(backup.get("path"), str):
                 raise BackupFailedError(
                     "required current pre-restore backup is unavailable"
                 )
+            pre_restore_backup = str(backup["path"])
+            try:
+                target_after = path.stat()
+            except FileNotFoundError:
+                target_after = None
+            target_overwritten = target_after is None or (
+                target_before.st_dev,
+                target_before.st_ino,
+                target_before.st_size,
+                target_before.st_mtime_ns,
+            ) != (
+                target_after.st_dev,
+                target_after.st_ino,
+                target_after.st_size,
+                target_after.st_mtime_ns,
+            )
             self.collection.close()
             try:
                 RustBackend().import_collection_package(
@@ -478,26 +486,29 @@ class CollectionAdapter:
                 )
                 self.collection.reopen()
                 self.collection._load_scheduler()  # pyright: ignore[reportPrivateUsage]
-            except Exception:
-                if self.collection.db is None:
-                    try:
-                        self.collection.reopen()
-                    except Exception as reopen_exc:
-                        recovery = self._newest_valid_backup()
-                        recovery_hint = (
-                            str(recovery) if recovery is not None else str(self._backup_folder)
-                        )
-                        raise RuntimeError(
-                            "restore failed and the collection could not be reopened; restart the "
-                            "sidecar and restore the collection from the pre-restore backup at "
-                            f"{recovery_hint}"
-                        ) from reopen_exc
-                raise
+            except Exception as exc:
+                try:
+                    self.collection.reopen()
+                except Exception:
+                    reopen_failed = True
+                else:
+                    reopen_failed = False
+                message = (
+                    "restore failed; the live collection may have been replaced or emptied — "
+                    f"restore the collection from the pre-restore backup at {pre_restore_backup}"
+                )
+                if reopen_failed:
+                    message += "; the sidecar must be restarted before further use"
+                raise RestoreFailedError(message) from exc
         self._pending_full_sync = None
         self._state.mark_pending_discarded_by_restore()
         self._post_restore_upload = True
         self._save_operational_status()
 
+        overwrite_warning = (
+            "the pre-restore backup now occupies the requested filename; original file "
+            "content was preserved for the restore"
+        )
         if mode == "local_only":
             server_sync_required: str | None = None
             if self._sync_auth is not None:
@@ -507,17 +518,32 @@ class CollectionAdapter:
                     ]
                 except NetworkError:
                     server_sync_required = None
+            if server_sync_required in {"FULL_SYNC", "FULL_DOWNLOAD", "FULL_UPLOAD"}:
+                warning = (
+                    f"the server requires {server_sync_required}; a normal sync will be refused "
+                    "— use anki_sync_full_upload(force=true) to replace the server"
+                )
+            elif server_sync_required == "NORMAL_SYNC":
+                warning = (
+                    "a normal sync would merge the server's newer changes onto this backup — use "
+                    "anki_sync_full_upload(force=true) to overwrite the server instead"
+                )
+            else:
+                warning = (
+                    "the server still holds its pre-restore state; a normal sync would merge it "
+                    "onto this backup — use anki_sync_full_upload(force=true) to overwrite the "
+                    "server instead"
+                )
+            if target_overwritten:
+                warning = f"{warning}; {overwrite_warning}"
             return {
                 "restored": True,
                 "mode": mode,
                 "remote_replaced": False,
                 "server_sync_required": server_sync_required,
+                "target_overwritten": target_overwritten,
                 "backup": backup,
-                "warning": (
-                    "the server still holds its pre-restore state; a normal sync would merge it "
-                    "onto this backup — use anki_sync_full_upload(force=true) to overwrite the "
-                    "server instead"
-                ),
+                "warning": warning,
             }
 
         try:
@@ -532,13 +558,21 @@ class CollectionAdapter:
         self._last_sync_at = datetime.now(UTC).isoformat()
         self._state.mark_all_remote_synced()
         self._save_operational_status()
+        media_warning = (
+            "the remote collection was replaced but remote media was not transferred; run "
+            "anki_sync(sync_media=true) to push media"
+        )
         return {
             "restored": True,
             "mode": mode,
             "remote_replaced": True,
+            "media_sync_required": True,
             "server_sync_required": None,
+            "target_overwritten": target_overwritten,
             "backup": backup,
-            "warning": None,
+            "warning": (
+                f"{media_warning}; {overwrite_warning}" if target_overwritten else media_warning
+            ),
         }
 
     def bootstrap(
@@ -665,7 +699,14 @@ class CollectionAdapter:
         self._state.put_receipt(idempotency_key, operation, request_hash, intent)
         try:
             result = mutate(self)
-        except (ValueError, LookupError, BackupFailedError, UndoEmpty):
+        except (
+            ValueError,
+            LookupError,
+            BackupFailedError,
+            UndoEmpty,
+            SyncLoginRequiredError,
+            RestoreFailedError,
+        ):
             self._state.delete_receipt(idempotency_key)
             raise
         receipt: dict[str, Any] = {
@@ -3232,13 +3273,12 @@ class CollectionAdapter:
                 self._invalidate_sync_auth()
             raise
         self._pending_full_sync = None
+        self._post_restore_upload = False
         self._last_sync_at = datetime.now(UTC).isoformat()
         if upload:
             self._state.mark_all_remote_synced()
         else:
             self._state.mark_pending_discarded_by_full_download()
-        if force:
-            self._post_restore_upload = False
         self._save_operational_status()
         return {
             "completed": True,
