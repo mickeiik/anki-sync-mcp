@@ -48,7 +48,7 @@ async def test_undo_and_redo_gate_on_expected_operation(
         assert initial["redo"] == ""
         assert initial["last_step"] == 0
         assert initial["durable"] is False
-        assert "cleared by synchronization" in initial["note"]
+        assert "cleared by successful synchronization" in initial["note"]
 
         note_id = await _create_note(service, note_type_id, "undo me")
         status = await service.undo_status()
@@ -226,3 +226,10 @@ def test_undo_status_reports_disabled_reason(tmp_path: Path) -> None:
     flagged_off = status(allow_undo=False, sync_on_write=False)
     assert "ANKI_ALLOW_UNDO" in flagged_off["disabled_reason"]
     assert status(allow_undo=True, sync_on_write=False)["disabled_reason"] is None
+    no_destructive = status(
+        allow_undo=True, sync_on_write=False, scopes="read,write,admin"
+    )
+    assert "destructive" in no_destructive["disabled_reason"]
+    both_blocked = status(allow_undo=False, sync_on_write=True)
+    assert "ANKI_SYNC_ON_WRITE" in both_blocked["disabled_reason"]
+    assert "ANKI_ALLOW_UNDO" in both_blocked["disabled_reason"]

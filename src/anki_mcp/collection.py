@@ -55,7 +55,7 @@ SYNC_REQUIRED_NAMES = (
 )
 UNDO_HISTORY_NOTE = (
     "Undo/redo history is held in memory for the running collection process; it is cleared by "
-    "synchronization and is not durable across restarts or full downloads."
+    "successful synchronization and is not durable across restarts or full downloads."
 )
 DECK_PRESET_SECTIONS: dict[str, tuple[str, ...]] = {
     "learning": (

@@ -2023,18 +2023,19 @@ def create_app(settings: Settings) -> ASGIApp:
         result = await execute(service.coordinated_read(lambda adapter: adapter.undo_status()))
         if not isinstance(result, dict):  # pragma: no cover - adapter always returns a mapping
             raise RuntimeError("undo status returned an invalid result")
+        reasons: list[str] = []
         if settings.sync_on_write:
-            result["disabled_reason"] = (
-                "undo and redo are unavailable while ANKI_SYNC_ON_WRITE is enabled, because "
-                "every synchronization clears Anki's in-memory undo history; set "
-                "ANKI_SYNC_ON_WRITE=false to use them"
+            reasons.append(
+                "ANKI_SYNC_ON_WRITE is enabled and a successful synchronization clears "
+                "Anki's in-memory undo history"
             )
-        elif not settings.allow_undo:
-            result["disabled_reason"] = (
-                "undo and redo are not registered because ANKI_ALLOW_UNDO is disabled"
-            )
-        else:
-            result["disabled_reason"] = None
+        if not settings.allow_undo:
+            reasons.append("ANKI_ALLOW_UNDO is disabled")
+        if "destructive" not in settings.scopes:
+            reasons.append("MCP_SCOPES does not include destructive")
+        result["disabled_reason"] = (
+            f"undo and redo are not registered: {'; '.join(reasons)}" if reasons else None
+        )
         return result
 
     @scoped_tool(
