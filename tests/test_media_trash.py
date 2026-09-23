@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -90,10 +91,13 @@ async def test_preview_reports_trashed_media_and_fingerprint(tmp_path: Path) -> 
     async with AnkiCollectionService(str(path), max_page_size=100) as service:
         first = await service.executor.run(lambda adapter: adapter.preview_media_empty_trash())
         second = await service.executor.run(lambda adapter: adapter.preview_media_empty_trash())
+        (_trash_folder(path) / "c.txt").write_bytes(b"ccc")
+        third = await service.executor.run(lambda adapter: adapter.preview_media_empty_trash())
 
     assert first["files"] == 2
     assert first["bytes"] == 6
     assert first["state_fingerprint"] == second["state_fingerprint"]
+    assert first["state_fingerprint"] != third["state_fingerprint"]
 
 
 @pytest.mark.anyio
@@ -107,6 +111,7 @@ async def test_preview_reports_zero_when_nothing_trashed(tmp_path: Path) -> None
 
     assert preview["files"] == 0
     assert preview["bytes"] == 0
+    assert "state_fingerprint" in preview
 
 
 @pytest.mark.anyio
@@ -193,3 +198,85 @@ def test_app_empty_trash_guarded_flow(tmp_path: Path, monkeypatch: pytest.Monkey
     assert Path(applied["result"]["backup"]["path"]).is_file()
     assert token not in json.dumps(applied)
     assert not trash.exists() or not any(trash.iterdir())
+
+
+@pytest.mark.anyio
+async def test_preview_and_empty_reject_symlinked_trash_folder(tmp_path: Path) -> None:
+    path = tmp_path / "collection.anki2"
+    collection = Collection(str(path))
+    try:
+        media_dir = Path(collection.media.dir())
+        media_dir.mkdir(parents=True, exist_ok=True)
+        (media_dir / "live.txt").write_bytes(b"live")
+    finally:
+        collection.close()
+    os.symlink(media_dir, media_dir.parent / "media.trash")
+
+    async with AnkiCollectionService(str(path), max_page_size=100) as service:
+        with pytest.raises(ValueError, match="symbolic link"):
+            await service.executor.run(
+                lambda adapter: adapter.preview_media_empty_trash()
+            )
+        with pytest.raises(ValueError, match="symbolic link"):
+            await service.executor.run(lambda adapter: adapter.empty_media_trash())
+
+    assert (media_dir / "live.txt").read_bytes() == b"live"
+
+
+@pytest.mark.anyio
+async def test_preview_rejects_non_directory_trash_path(tmp_path: Path) -> None:
+    path = tmp_path / "collection.anki2"
+    collection = Collection(str(path))
+    collection.close()
+    (tmp_path / "media.trash").write_bytes(b"not a dir")
+
+    async with AnkiCollectionService(str(path), max_page_size=100) as service:
+        with pytest.raises(ValueError, match="not a directory"):
+            await service.executor.run(
+                lambda adapter: adapter.preview_media_empty_trash()
+            )
+
+
+@pytest.mark.anyio
+async def test_preview_rejects_non_regular_trash_entry(tmp_path: Path) -> None:
+    path = tmp_path / "collection.anki2"
+    collection = Collection(str(path))
+    collection.close()
+    (tmp_path / "media.trash" / "subdir").mkdir(parents=True)
+
+    async with AnkiCollectionService(str(path), max_page_size=100) as service:
+        with pytest.raises(ValueError, match="non-regular"):
+            await service.executor.run(
+                lambda adapter: adapter.preview_media_empty_trash()
+            )
+
+
+@pytest.mark.anyio
+async def test_preview_raises_when_scan_bound_is_exceeded(tmp_path: Path) -> None:
+    path = tmp_path / "collection.anki2"
+    _trashed_collection(path, {"a.txt": b"aaaa", "b.txt": b"bb"})
+
+    async with AnkiCollectionService(
+        str(path), max_page_size=100, max_search_scan=1
+    ) as service:
+        with pytest.raises(ValueError, match="MCP_MAX_SEARCH_SCAN"):
+            await service.executor.run(
+                lambda adapter: adapter.preview_media_empty_trash()
+            )
+
+
+@pytest.mark.anyio
+async def test_preview_handles_non_utf8_trash_filename(tmp_path: Path) -> None:
+    path = tmp_path / "collection.anki2"
+    collection = Collection(str(path))
+    collection.close()
+    trash = tmp_path / "media.trash"
+    trash.mkdir()
+    (trash / os.fsdecode(os.fsencode(b"bad\xff.bin"))).write_bytes(b"x")
+
+    async with AnkiCollectionService(str(path), max_page_size=100) as service:
+        preview = await service.executor.run(
+            lambda adapter: adapter.preview_media_empty_trash()
+        )
+
+    assert preview["files"] == 1

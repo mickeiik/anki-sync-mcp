@@ -237,6 +237,43 @@ def test_scope_and_safety_flags_control_tool_discovery(phase_settings: Settings)
     assert "anki_sync_full_download" in all_names
     assert "anki_sync_full_upload" in all_names
 
+    no_destructive = phase_settings.model_copy(
+        update={
+            "scopes_csv": "read,write,admin,destructive",
+            "allow_destructive": False,
+        }
+    )
+    with TestClient(create_app(no_destructive)) as client:
+        headers = {
+            "Authorization": "Bearer phase-token",
+            "Accept": "application/json, text/event-stream",
+        }
+        initialized = client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "pytest", "version": "1"},
+                },
+            },
+        )
+        headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+        listed = client.post(
+            "/mcp",
+            headers=headers,
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        )
+    no_destructive_names = [
+        tool["name"] for tool in listed.json()["result"]["tools"]
+    ]
+    assert "anki_media_empty_trash_preview" not in no_destructive_names
+    assert "anki_media_empty_trash" not in no_destructive_names
+
 
 def test_note_and_card_control_tools_return_durable_receipts(
     phase_settings: Settings,

@@ -2711,36 +2711,45 @@ class CollectionAdapter:
         }
 
     def _media_trash_folder(self) -> Path:
-        return Path(self.collection.media.dir()).parent / "media.trash"
+        folder = Path(self.collection.media.dir()).parent / "media.trash"
+        if folder.is_symlink():
+            raise ValueError("media.trash must not be a symbolic link")
+        return folder
+
+    def _media_trash_entries(self) -> list[tuple[str, int, int]]:
+        folder = self._media_trash_folder()
+        entries: list[tuple[str, int, int]] = []
+        if folder.exists() and not folder.is_dir():
+            raise ValueError("media trash path is not a directory")
+        if folder.is_dir():
+            for path in folder.iterdir():
+                if path.is_symlink() or not path.is_file():
+                    raise ValueError("media trash contains a non-regular file")
+                stat = path.stat()
+                entries.append((path.name, stat.st_size, stat.st_mtime_ns))
+                if len(entries) > self.max_search_scan:
+                    raise ValueError(
+                        "media trash exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
+                    )
+        return entries
 
     def preview_media_empty_trash(self) -> dict[str, Any]:
-        folder = self._media_trash_folder()
-        entries: list[tuple[str, int]] = []
-        if folder.is_dir():
-            for path in sorted(folder.iterdir(), key=lambda item: item.name):
-                if path.is_file() and not path.is_symlink():
-                    entries.append((path.name, path.stat().st_size))
-        if len(entries) > self.max_search_scan:
-            raise ValueError(
-                "media trash exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
-            )
+        entries = sorted(self._media_trash_entries())
         return {
             "files": len(entries),
-            "bytes": sum(size for _, size in entries),
+            "bytes": sum(size for _, size, _ in entries),
             "state_fingerprint": self._impact_fingerprint(
-                [[name, size] for name, size in entries]
+                [
+                    [name.encode("utf-8", "surrogateescape").hex(), size, mtime_ns]
+                    for name, size, mtime_ns in entries
+                ]
             ),
         }
 
     def empty_media_trash(self) -> dict[str, Any]:
-        folder = self._media_trash_folder()
-        count = 0
-        if folder.is_dir():
-            count = sum(
-                1 for path in folder.iterdir() if path.is_file() and not path.is_symlink()
-            )
+        files_removed = len(self._media_trash_entries())
         self.collection.media.empty_trash()
-        return {"emptied": True, "files_removed": count}
+        return {"emptied": True, "files_removed": files_removed}
 
     def check_media(self, offset: int, limit: int) -> dict[str, Any]:
         self._page([], offset, limit)

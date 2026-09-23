@@ -2054,7 +2054,11 @@ def create_app(settings: Settings) -> ASGIApp:
         confirmation_token: ConfirmationToken,
         idempotency_key: IdempotencyKey | None = None,
     ) -> dict[str, Any]:
-        """Permanently delete trashed media after a matching impact preview and required backup."""
+        """Permanently delete trashed media after a matching impact preview and required backup.
+
+        The verified backup contains the collection database only, so emptied media cannot be
+        restored.
+        """
         request: dict[str, Any] = {}
         return await guarded_mutate(
             "anki_media_empty_trash",
