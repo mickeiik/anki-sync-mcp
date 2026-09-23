@@ -21,6 +21,7 @@ from starlette.testclient import TestClient
 from anki_mcp.app import create_app
 from anki_mcp.collection import (
     AnkiCollectionService,
+    BackupFailedError,
     CollectionAdapter,
     RestoreFailedError,
     SyncLoginRequiredError,
@@ -159,6 +160,19 @@ def test_backup_filename_and_content_validation(tmp_path: Path) -> None:
             (backup_folder / "link.colpkg").symlink_to(backup_folder / good)
             with pytest.raises(ValueError, match="symbolic link"):
                 await service.preview_backup_restore("link.colpkg")
+
+    asyncio.run(scenario())
+
+
+def test_create_backup_reports_unusable_folder_as_backup_failure(tmp_path: Path) -> None:
+    path, _, _ = _seed_collection(tmp_path)
+    # A regular file where the backup folder must be makes folder preparation fail.
+    (Path(path).parent / "backups").write_text("not a directory")
+
+    async def scenario() -> None:
+        async with AnkiCollectionService(path, max_page_size=100) as service:
+            with pytest.raises(BackupFailedError):
+                await service.create_backup()
 
     asyncio.run(scenario())
 

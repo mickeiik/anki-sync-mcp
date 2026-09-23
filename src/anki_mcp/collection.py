@@ -363,6 +363,15 @@ class CollectionAdapter:
         return metrics
 
     def create_backup(self) -> dict[str, Any]:
+        """Create a verified native backup, reporting any failure as a backup failure."""
+        try:
+            return self._create_backup()
+        except BackupFailedError:
+            raise
+        except Exception as exc:
+            raise BackupFailedError(f"native backup failed: {exc}") from exc
+
+    def _create_backup(self) -> dict[str, Any]:
         self._backup_folder.mkdir(parents=True, exist_ok=True)
         existing = {
             path: (
@@ -373,12 +382,9 @@ class CollectionAdapter:
             )
             for path in self._backup_folder.glob("*.colpkg")
         }
-        try:
-            native_created = self.collection.create_backup(
-                backup_folder=str(self._backup_folder), force=True, wait_for_completion=True
-            )
-        except Exception as exc:
-            raise BackupFailedError(f"native backup failed: {exc}") from exc
+        native_created = self.collection.create_backup(
+            backup_folder=str(self._backup_folder), force=True, wait_for_completion=True
+        )
         candidates = set(self._backup_folder.glob("*.colpkg"))
         fresh = {
             path
@@ -2238,7 +2244,7 @@ class CollectionAdapter:
             raise ValueError("tag names must not be blank")
         if source == target:
             raise ValueError("source and target tags must differ")
-        if target.startswith(source + "::"):
+        if target.casefold().startswith(source.casefold() + "::"):
             raise ValueError("target must not be a child of source")
         if source not in self.collection.tags.all():
             raise LookupError(f"tag {source} not found")
@@ -2281,21 +2287,25 @@ class CollectionAdapter:
             raise ValueError(
                 "collection exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
             )
+        affected, _ = self._scan_tag_merge(source, target)
         result = self.collection.tags.rename(source, target)
         duplicate_notes_fixed = 0
-        for note_id in self.collection.find_notes(""):
-            note = self.collection.get_note(note_id)
+        for note_id in affected:
+            note = self.collection.get_note(cast("NoteId", note_id))
             deduped = list(dict.fromkeys(note.tags))
             if len(deduped) != len(note.tags):
                 note.tags = deduped
                 self.collection.update_note(note)
                 duplicate_notes_fixed += 1
+        if source in self.collection.tags.all():
+            # An unused tag is note-driven and survives rename; drop the registry entry.
+            self.collection.tags.remove(source)
         return {
             "source": source,
             "target": target,
             "updated_notes": int(result.count),
             "duplicate_notes_fixed": duplicate_notes_fixed,
-            "deleted": True,
+            "deleted": source not in self.collection.tags.all(),
         }
 
     def list_note_types(self, offset: int, limit: int) -> dict[str, Any]:

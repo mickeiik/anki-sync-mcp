@@ -64,6 +64,8 @@ async def test_preview_tag_merge_validates_and_fingerprints(tag_collection: str)
             await service.preview_tag_merge("source", "source")
         with pytest.raises(ValueError):
             await service.preview_tag_merge("source", "source::child")
+        with pytest.raises(ValueError):
+            await service.preview_tag_merge("source", "SOURCE::child")
         first = await service.preview_tag_merge("source", "target")
         second = await service.preview_tag_merge("source", "target")
     assert first["notes"] == 3
@@ -91,5 +93,40 @@ async def test_merge_tags_dedupes_and_renames_children(tag_collection: str) -> N
         for note_id in collection.find_notes(""):
             note = collection.get_note(note_id)
             assert len(note.tags) == len(set(note.tags)), note.tags
+    finally:
+        collection.close()
+
+
+@pytest.mark.anyio
+async def test_merge_tags_removes_unused_registry_tag(tmp_path: Path) -> None:
+    path = str(tmp_path / "collection.anki2")
+    collection = Collection(path)
+    try:
+        model = collection.models.current()
+        deck_id = int(collection.decks.id("Tags"))
+        note = collection.new_note(model)
+        note["Front"] = "front"
+        note["Back"] = "back"
+        note.tags = ["unused", "keep"]
+        collection.add_note(note, deck_id)
+        stripped = collection.get_note(note.id)
+        stripped.tags = ["keep"]
+        collection.update_note(stripped)
+        assert "unused" in collection.tags.all()  # unused tags linger in the registry
+    finally:
+        collection.close()
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        preview = await service.preview_tag_merge("unused", "target")
+        assert preview["notes"] == 0
+        result = await service.merge_tags("unused", "target")
+    assert result["updated_notes"] == 0
+    assert result["deleted"] is True
+
+    collection = Collection(path)
+    try:
+        tags = set(collection.tags.all())
+        assert "unused" not in tags
+        assert "keep" in tags
     finally:
         collection.close()
