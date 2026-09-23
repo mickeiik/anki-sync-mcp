@@ -271,6 +271,12 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_media_delete",
         "anki_media_empty_trash_preview",
         "anki_media_empty_trash",
+        "anki_maintenance_check_database_preview",
+        "anki_maintenance_check_database",
+        "anki_maintenance_empty_cards_preview",
+        "anki_maintenance_empty_cards",
+        "anki_maintenance_optimize_preview",
+        "anki_maintenance_optimize",
         "anki_export_apkg",
         "anki_export_notes_csv",
         "anki_import_files_list",
@@ -458,6 +464,9 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_note_types_delete",
         "anki_media_delete",
         "anki_media_empty_trash",
+        "anki_maintenance_check_database",
+        "anki_maintenance_empty_cards",
+        "anki_maintenance_optimize",
     ):
         assert by_name[name]["inputSchema"]["properties"]["confirmation_token"]["type"] == "string"
 

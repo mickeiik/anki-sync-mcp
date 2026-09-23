@@ -129,6 +129,12 @@ def test_scope_and_safety_flags_control_tool_discovery(phase_settings: Settings)
     assert "anki_media_delete" not in names
     assert "anki_media_empty_trash_preview" not in names
     assert "anki_media_empty_trash" not in names
+    assert "anki_maintenance_check_database_preview" not in names
+    assert "anki_maintenance_check_database" not in names
+    assert "anki_maintenance_empty_cards_preview" not in names
+    assert "anki_maintenance_empty_cards" not in names
+    assert "anki_maintenance_optimize_preview" not in names
+    assert "anki_maintenance_optimize" not in names
     assert "anki_sync_full_download" not in names
     assert "anki_sync_full_upload" not in names
 
@@ -234,6 +240,12 @@ def test_scope_and_safety_flags_control_tool_discovery(phase_settings: Settings)
     assert "anki_media_delete" in all_names
     assert "anki_media_empty_trash_preview" in all_names
     assert "anki_media_empty_trash" in all_names
+    assert "anki_maintenance_check_database_preview" in all_names
+    assert "anki_maintenance_check_database" in all_names
+    assert "anki_maintenance_empty_cards_preview" in all_names
+    assert "anki_maintenance_empty_cards" in all_names
+    assert "anki_maintenance_optimize_preview" in all_names
+    assert "anki_maintenance_optimize" in all_names
     assert "anki_sync_full_download" in all_names
     assert "anki_sync_full_upload" in all_names
 

@@ -2074,6 +2074,111 @@ def create_app(settings: Settings) -> ASGIApp:
             sync_media=True,
         )
 
+    @scoped_tool(
+        name="anki_maintenance_check_database_preview",
+        scope="destructive",
+        enabled=settings.allow_destructive,
+    )
+    async def maintenance_check_database_preview() -> dict[str, Any]:
+        """Preview read-only database integrity problems before repairing them."""
+        request: dict[str, Any] = {}
+        return await preview(
+            "anki_maintenance_check_database",
+            request,
+            lambda adapter: adapter.preview_check_database(),
+        )
+
+    @scoped_tool(
+        name="anki_maintenance_check_database",
+        scope="destructive",
+        enabled=settings.allow_destructive,
+    )
+    async def maintenance_check_database(
+        confirmation_token: ConfirmationToken,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Check and repair the collection database after a matching integrity preview."""
+        request: dict[str, Any] = {}
+        return await guarded_mutate(
+            "anki_maintenance_check_database",
+            idempotency_key,
+            request,
+            confirmation_token,
+            request,
+            lambda adapter: adapter.preview_check_database(),
+            lambda adapter: adapter.check_database(),
+        )
+
+    @scoped_tool(
+        name="anki_maintenance_empty_cards_preview",
+        scope="destructive",
+        enabled=settings.allow_destructive,
+    )
+    async def maintenance_empty_cards_preview() -> dict[str, Any]:
+        """Preview the empty cards that will be deleted from the collection."""
+        request: dict[str, Any] = {}
+        return await preview(
+            "anki_maintenance_empty_cards",
+            request,
+            lambda adapter: adapter.preview_empty_cards(),
+        )
+
+    @scoped_tool(
+        name="anki_maintenance_empty_cards",
+        scope="destructive",
+        enabled=settings.allow_destructive,
+    )
+    async def maintenance_empty_cards(
+        confirmation_token: ConfirmationToken,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Delete empty cards and orphaned notes after a matching impact preview."""
+        request: dict[str, Any] = {}
+        return await guarded_mutate(
+            "anki_maintenance_empty_cards",
+            idempotency_key,
+            request,
+            confirmation_token,
+            request,
+            lambda adapter: adapter.preview_empty_cards(),
+            lambda adapter: adapter.empty_cards(),
+        )
+
+    @scoped_tool(
+        name="anki_maintenance_optimize_preview",
+        scope="destructive",
+        enabled=settings.allow_destructive,
+    )
+    async def maintenance_optimize_preview() -> dict[str, Any]:
+        """Preview collection counts and on-disk size before optimizing the database."""
+        request: dict[str, Any] = {}
+        return await preview(
+            "anki_maintenance_optimize",
+            request,
+            lambda adapter: adapter.preview_optimize_database(),
+        )
+
+    @scoped_tool(
+        name="anki_maintenance_optimize",
+        scope="destructive",
+        enabled=settings.allow_destructive,
+    )
+    async def maintenance_optimize(
+        confirmation_token: ConfirmationToken,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Vacuum and analyze the collection database after a matching size preview."""
+        request: dict[str, Any] = {}
+        return await guarded_mutate(
+            "anki_maintenance_optimize",
+            idempotency_key,
+            request,
+            confirmation_token,
+            request,
+            lambda adapter: adapter.preview_optimize_database(),
+            lambda adapter: adapter.optimize_database(),
+        )
+
     @scoped_tool(name="anki_export_apkg", scope="read")
     async def export_apkg(
         deck_id: StableId | None = None,

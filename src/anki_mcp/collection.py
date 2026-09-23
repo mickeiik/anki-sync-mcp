@@ -2758,6 +2758,85 @@ class CollectionAdapter:
         self.collection.media.empty_trash()
         return {"emptied": True, "files_removed": files_removed}
 
+    def preview_check_database(self) -> dict[str, Any]:
+        backend = self.collection._backend  # pyright: ignore[reportPrivateUsage]
+        problems = [str(problem) for problem in backend.check_database()]
+        if len(problems) > self.max_search_scan:
+            raise ValueError(
+                "database check exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
+            )
+        return {
+            "problems": [
+                self._truncate_rendered(problem)[0]
+                for problem in problems[: self.max_page_size]
+            ],
+            "total": len(problems),
+            "problems_truncated": len(problems) > self.max_page_size,
+            "ok": not problems,
+            "state_fingerprint": self._impact_fingerprint(problems),
+        }
+
+    def check_database(self) -> dict[str, Any]:
+        report, ok = self.collection.fix_integrity()
+        text, truncated = self._truncate_rendered(report)
+        return {"ok": ok, "repaired": True, "report": text, "report_truncated": truncated}
+
+    def preview_empty_cards(self) -> dict[str, Any]:
+        report = self.collection.get_empty_cards()
+        notes = [
+            (
+                int(note.note_id),
+                [int(card_id) for card_id in note.card_ids],
+                bool(note.will_delete_note),
+            )
+            for note in report.notes
+        ]
+        if len(notes) > self.max_search_scan:
+            raise ValueError(
+                "empty-card scan exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
+            )
+        return {
+            "notes": len(notes),
+            "cards": sum(len(card_ids) for _, card_ids, _ in notes),
+            "notes_to_delete": sum(1 for _, _, will_delete in notes if will_delete),
+            "state_fingerprint": self._impact_fingerprint(notes),
+        }
+
+    def empty_cards(self) -> dict[str, Any]:
+        report = self.collection.get_empty_cards()
+        notes = [
+            (int(n.note_id), [int(c) for c in n.card_ids], bool(n.will_delete_note))
+            for n in report.notes
+        ]
+        card_ids = [card_id for _, card_ids, _ in notes for card_id in card_ids]
+        notes_removed = sum(1 for _, _, will_delete in notes if will_delete)
+        if card_ids:
+            self.collection.remove_cards_and_orphaned_notes(
+                [cast("CardId", card_id) for card_id in card_ids]
+            )
+        return {"cards_removed": len(card_ids), "notes_removed": notes_removed, "emptied": True}
+
+    def preview_optimize_database(self) -> dict[str, Any]:
+        path = Path(self.collection.path)
+        size = path.stat().st_size if path.is_file() else 0
+        cards = int(self.collection.card_count())
+        notes = int(self.collection.note_count())
+        return {
+            "card_count": cards,
+            "note_count": notes,
+            "size_bytes": size,
+            "state_fingerprint": self._impact_fingerprint(
+                {"cards": cards, "notes": notes, "size": size}
+            ),
+        }
+
+    def optimize_database(self) -> dict[str, Any]:
+        path = Path(self.collection.path)
+        size_before = path.stat().st_size if path.is_file() else 0
+        self.collection.optimize()
+        size_after = path.stat().st_size if path.is_file() else 0
+        return {"optimized": True, "size_before_bytes": size_before, "size_after_bytes": size_after}
+
     def check_media(self, offset: int, limit: int) -> dict[str, Any]:
         self._page([], offset, limit)
         response = self.collection.media.check()
