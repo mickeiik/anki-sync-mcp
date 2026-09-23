@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+from anki._backend_generated import RustBackendGenerated
 from anki.collection import Collection
 from starlette.testclient import TestClient
 
@@ -96,21 +97,30 @@ async def test_preview_check_database_is_read_only(
     _seed(path, empty=0, valid=1)
 
     calls: list[str] = []
+    backend_calls: list[str] = []
 
     def recording_fix_integrity(self: Collection) -> tuple[str, bool]:
         calls.append("fix_integrity")
         return ("recorded integrity report", False)
 
+    original_backend_check = RustBackendGenerated.check_database
+
+    def recording_backend_check(self: RustBackendGenerated) -> list[str]:
+        backend_calls.append("check_database")
+        return list(original_backend_check(self))
+
     monkeypatch.setattr(Collection, "fix_integrity", recording_fix_integrity)
+    monkeypatch.setattr(RustBackendGenerated, "check_database", recording_backend_check)
 
     async with AnkiCollectionService(str(path), max_page_size=100) as service:
+        backend_calls.clear()
         preview = await service.executor.run(lambda adapter: adapter.preview_check_database())
-        # The preview must never run Anki's repairable integrity routine.
+        # The preview must never run Anki's repairable integrity routine, directly or via
+        # fix_integrity.
         assert calls == []
+        assert backend_calls == []
         assert preview["card_count"] == 1
         assert preview["note_count"] == 1
-        assert isinstance(preview["size_bytes"], int)
-        assert preview["size_bytes"] > 0
         assert isinstance(preview["state_fingerprint"], str)
         applied = await service.executor.run(lambda adapter: adapter.check_database())
         assert calls == ["fix_integrity"]
@@ -170,7 +180,6 @@ async def test_optimize_database_runs_and_reports_logical_sizes(
     assert calls == ["optimize"]
     assert preview["card_count"] == 1
     assert preview["note_count"] == 1
-    assert isinstance(preview["size_bytes"], int)
     assert applied["optimized"] is True
     assert isinstance(applied["size_before_bytes"], int)
     assert isinstance(applied["size_after_bytes"], int)
@@ -347,6 +356,7 @@ def test_app_check_database_guarded_flow(
         )
 
     assert applied["state"] == "committed"
+    assert applied["result"]["report"]
     assert Path(applied["result"]["backup"]["path"]).is_file()
     assert token not in json.dumps(applied)
 
@@ -385,5 +395,6 @@ def test_app_optimize_guarded_flow(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
     assert applied["state"] == "committed"
     assert applied["result"]["optimized"] is True
+    assert applied["result"]["size_before_bytes"] > 0
     assert Path(applied["result"]["backup"]["path"]).is_file()
     assert token not in json.dumps(applied)

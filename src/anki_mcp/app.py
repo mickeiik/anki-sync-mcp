@@ -2080,7 +2080,7 @@ def create_app(settings: Settings) -> ASGIApp:
         enabled=settings.allow_destructive,
     )
     async def maintenance_check_database_preview() -> dict[str, Any]:
-        """Preview a read-only collection snapshot (counts and logical size).
+        """Preview a read-only collection snapshot (card and note counts).
 
         Anki's database check also repairs, so the integrity problems are not reported here;
         the apply performs the check-and-repair.

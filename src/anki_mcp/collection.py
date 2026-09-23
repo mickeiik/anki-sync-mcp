@@ -2765,12 +2765,13 @@ class CollectionAdapter:
         return int(db.scalar("pragma page_count")) * int(db.scalar("pragma page_size"))
 
     def _collection_state_preview(self) -> dict[str, Any]:
+        # Counts only: the fingerprint must not change on benign size-only drift (WAL
+        # checkpointing, field growth), which would spuriously invalidate a preview token.
         cards = int(self.collection.card_count())
         notes = int(self.collection.note_count())
         return {
             "card_count": cards,
             "note_count": notes,
-            "size_bytes": self._logical_database_size(),
             "state_fingerprint": self._impact_fingerprint({"cards": cards, "notes": notes}),
         }
 
