@@ -71,6 +71,7 @@ async def test_deck_options_counts_empty_default_deck_absent_from_due_tree(
     collection = Collection(path)
     try:
         collection.decks.id("Other")  # leaves the Default deck empty and childless
+        assert collection.decks.find_deck_in_tree(collection.sched.deck_due_tree(), 1) is None
     finally:
         collection.close()
 
