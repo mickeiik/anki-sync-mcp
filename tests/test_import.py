@@ -1079,7 +1079,7 @@ def test_app_inline_import_requires_exactly_one_source(
             client, headers, 5, "anki_import_apkg_preview", {"content_base64": "aGVsbG8=!"}
         )
         assert malformed.get("isError") is True
-        assert "INVALID_ARGUMENT" in malformed["content"][0]["text"]
+        assert "not valid base64" in malformed["content"][0]["text"]
 
 
 def test_app_inline_apkg_token_binds_content(
