@@ -285,6 +285,15 @@ def test_scope_and_safety_flags_control_tool_discovery(phase_settings: Settings)
     ]
     assert "anki_media_empty_trash_preview" not in no_destructive_names
     assert "anki_media_empty_trash" not in no_destructive_names
+    for name in (
+        "anki_maintenance_check_database_preview",
+        "anki_maintenance_check_database",
+        "anki_maintenance_empty_cards_preview",
+        "anki_maintenance_empty_cards",
+        "anki_maintenance_optimize_preview",
+        "anki_maintenance_optimize",
+    ):
+        assert name not in no_destructive_names
 
 
 def test_note_and_card_control_tools_return_durable_receipts(

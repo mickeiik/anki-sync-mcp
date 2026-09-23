@@ -2758,28 +2758,31 @@ class CollectionAdapter:
         self.collection.media.empty_trash()
         return {"emptied": True, "files_removed": files_removed}
 
-    def preview_check_database(self) -> dict[str, Any]:
-        backend = self.collection._backend  # pyright: ignore[reportPrivateUsage]
-        problems = [str(problem) for problem in backend.check_database()]
-        if len(problems) > self.max_search_scan:
-            raise ValueError(
-                "database check exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
-            )
+    def _logical_database_size(self) -> int:
+        db = self.collection.db
+        if db is None:
+            raise RuntimeError("collection database is not open")
+        return int(db.scalar("pragma page_count")) * int(db.scalar("pragma page_size"))
+
+    def _collection_state_preview(self) -> dict[str, Any]:
+        cards = int(self.collection.card_count())
+        notes = int(self.collection.note_count())
         return {
-            "problems": [
-                self._truncate_rendered(problem)[0]
-                for problem in problems[: self.max_page_size]
-            ],
-            "total": len(problems),
-            "problems_truncated": len(problems) > self.max_page_size,
-            "ok": not problems,
-            "state_fingerprint": self._impact_fingerprint(problems),
+            "card_count": cards,
+            "note_count": notes,
+            "size_bytes": self._logical_database_size(),
+            "state_fingerprint": self._impact_fingerprint({"cards": cards, "notes": notes}),
         }
+
+    def preview_check_database(self) -> dict[str, Any]:
+        """Read-only collection snapshot; Anki's integrity check also repairs, so the
+        problems are reported by the guarded apply rather than here."""
+        return self._collection_state_preview()
 
     def check_database(self) -> dict[str, Any]:
         report, ok = self.collection.fix_integrity()
         text, truncated = self._truncate_rendered(report)
-        return {"ok": ok, "repaired": True, "report": text, "report_truncated": truncated}
+        return {"ok": ok, "report": text, "report_truncated": truncated}
 
     def preview_empty_cards(self) -> dict[str, Any]:
         report = self.collection.get_empty_cards()
@@ -2817,24 +2820,12 @@ class CollectionAdapter:
         return {"cards_removed": len(card_ids), "notes_removed": notes_removed, "emptied": True}
 
     def preview_optimize_database(self) -> dict[str, Any]:
-        path = Path(self.collection.path)
-        size = path.stat().st_size if path.is_file() else 0
-        cards = int(self.collection.card_count())
-        notes = int(self.collection.note_count())
-        return {
-            "card_count": cards,
-            "note_count": notes,
-            "size_bytes": size,
-            "state_fingerprint": self._impact_fingerprint(
-                {"cards": cards, "notes": notes, "size": size}
-            ),
-        }
+        return self._collection_state_preview()
 
     def optimize_database(self) -> dict[str, Any]:
-        path = Path(self.collection.path)
-        size_before = path.stat().st_size if path.is_file() else 0
+        size_before = self._logical_database_size()
         self.collection.optimize()
-        size_after = path.stat().st_size if path.is_file() else 0
+        size_after = self._logical_database_size()
         return {"optimized": True, "size_before_bytes": size_before, "size_after_bytes": size_after}
 
     def check_media(self, offset: int, limit: int) -> dict[str, Any]:

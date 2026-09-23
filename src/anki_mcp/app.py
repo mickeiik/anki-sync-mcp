@@ -2080,7 +2080,11 @@ def create_app(settings: Settings) -> ASGIApp:
         enabled=settings.allow_destructive,
     )
     async def maintenance_check_database_preview() -> dict[str, Any]:
-        """Preview read-only database integrity problems before repairing them."""
+        """Preview a read-only collection snapshot (counts and logical size).
+
+        Anki's database check also repairs, so the integrity problems are not reported here;
+        the apply performs the check-and-repair.
+        """
         request: dict[str, Any] = {}
         return await preview(
             "anki_maintenance_check_database",
@@ -2097,7 +2101,7 @@ def create_app(settings: Settings) -> ASGIApp:
         confirmation_token: ConfirmationToken,
         idempotency_key: IdempotencyKey | None = None,
     ) -> dict[str, Any]:
-        """Check and repair the collection database after a matching integrity preview."""
+        """Check and repair the collection database under the preview token and pre-op backup."""
         request: dict[str, Any] = {}
         return await guarded_mutate(
             "anki_maintenance_check_database",
