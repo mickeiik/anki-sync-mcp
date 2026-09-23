@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import resource
 import signal
 import zipfile
@@ -11,8 +12,11 @@ from pathlib import Path
 import pytest
 from anki.collection import Collection
 from anki.errors import InvalidInput
+from starlette.testclient import TestClient
 
+from anki_mcp.app import create_app
 from anki_mcp.collection import AnkiCollectionService, ResourceLimitError
+from anki_mcp.config import Settings
 
 
 @pytest.fixture
@@ -125,6 +129,59 @@ async def test_export_apkg_omits_inline_when_over_response_budget(
     assert "content_base64" not in result
     assert result["inline_omitted"] is True
     assert result["inline_reason"] == "inline payload would exceed MCP_MAX_RESPONSE_BYTES"
+
+
+def test_app_export_apkg_inline_passes_through(
+    export_collection: tuple[str, int, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, deck_a, _ = export_collection
+    monkeypatch.setenv("MCP_AUTH_TOKEN", "export-token")
+    monkeypatch.setenv("ANKI_COLLECTION_PATH", path)
+    monkeypatch.setenv("MCP_SCOPES", "read")
+    settings = Settings(_env_file=None)
+
+    with TestClient(create_app(settings)) as client:
+        headers = {
+            "Authorization": "Bearer export-token",
+            "Accept": "application/json, text/event-stream",
+        }
+        initialized = client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "pytest", "version": "1"},
+                },
+            },
+        )
+        headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+        response = client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "anki_export_apkg",
+                    "arguments": {
+                        "deck_id": deck_a,
+                        "include_media": False,
+                        "include_scheduling": True,
+                        "inline": True,
+                    },
+                },
+            },
+        )
+
+    payload = json.loads(response.json()["result"]["content"][0]["text"])
+    assert "inline_omitted" not in payload
+    assert base64.b64decode(payload["content_base64"]) == Path(payload["path"]).read_bytes()
 
 
 @pytest.mark.anyio

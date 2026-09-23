@@ -69,7 +69,9 @@ MediaContent = Annotated[StrictStr, Field(min_length=1, max_length=22_369_624)]
 InlineImportContent = Annotated[StrictStr, Field(min_length=1, max_length=22_369_624)]
 StableIds = Annotated[list[StableId], Field(min_length=1, max_length=500)]
 NonNegativeInt = Annotated[StrictInt, Field(ge=0)]
-CsvColumn = Annotated[StrictInt, Field(ge=1)]
+CsvColumn = Annotated[
+    StrictInt, Field(ge=1, description="1-based CSV column number; 1 is the first column")
+]
 CsvFieldColumns = Annotated[list[CsvColumn], Field(max_length=1000)]
 PositiveInt = Annotated[StrictInt, Field(gt=0)]
 CardFlag = Annotated[StrictInt, Field(ge=0, le=7)]

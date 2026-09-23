@@ -350,7 +350,9 @@ def test_app_csv_import_rejects_zero_column(
             },
         )
     assert rejected.get("isError") is True
+    # The schema layer rejects 0 before the handler runs, so the message is generic.
     assert "INVALID_ARGUMENT" in rejected["content"][0]["text"]
+    assert "tool arguments failed validation" in rejected["content"][0]["text"]
 
 
 @pytest.mark.anyio
