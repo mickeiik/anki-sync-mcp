@@ -1550,7 +1550,7 @@ class CollectionAdapter:
             }
         if "counts" in requested:
             node = self.collection.decks.find_deck_in_tree(
-                self.collection.decks.deck_tree(), cast("DeckId", deck_id)
+                self.collection.sched.deck_due_tree(), cast("DeckId", deck_id)
             )
             if node is None:  # pragma: no cover - a fetched deck is present in the tree
                 raise RuntimeError("deck was not present in Anki's deck tree")

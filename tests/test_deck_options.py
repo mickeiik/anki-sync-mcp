@@ -21,6 +21,48 @@ def deck_options_collection(tmp_path: Path) -> Iterator[tuple[str, int, int]]:
     yield path, parent_id, child_id
 
 
+@pytest.fixture
+def counted_deck_collection(tmp_path: Path) -> Iterator[tuple[str, int, int]]:
+    path = str(tmp_path / "collection.anki2")
+    collection = Collection(path)
+    try:
+        parent_id = int(collection.decks.id("Counted"))
+        child_id = int(collection.decks.id("Counted::Child"))
+        model = collection.models.current()
+
+        parent_note = collection.new_note(model)
+        parent_note["Front"] = "parent card"
+        parent_note["Back"] = "answer"
+        collection.add_note(parent_note, parent_id)
+
+        child_note = collection.new_note(model)
+        child_note["Front"] = "child card"
+        child_note["Back"] = "answer"
+        collection.add_note(child_note, child_id)
+    finally:
+        collection.close()
+    yield path, parent_id, child_id
+
+
+@pytest.mark.anyio
+async def test_deck_options_counts_reflect_due_tree(
+    counted_deck_collection: tuple[str, int, int],
+) -> None:
+    path, parent_id, child_id = counted_deck_collection
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        parent = await service.get_deck_options(parent_id, include_sections=("counts",))
+        child = await service.get_deck_options(child_id, include_sections=("counts",))
+
+    parent_counts = parent["sections"]["counts"]
+    child_counts = child["sections"]["counts"]
+    assert parent_counts["new"] == 2  # includes the child deck's due cards
+    assert parent_counts["total_in_deck"] == 1
+    assert parent_counts["total_including_children"] == 2
+    assert child_counts["new"] == 1
+    assert child_counts["total_in_deck"] == 1
+
+
 @pytest.mark.anyio
 async def test_deck_options_are_compact_by_default_and_expand_requested_sections(
     deck_options_collection: tuple[str, int, int],
