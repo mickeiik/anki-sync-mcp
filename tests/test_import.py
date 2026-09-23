@@ -829,7 +829,8 @@ async def test_stage_inline_import_is_content_addressed_and_idempotent(
         )
         with pytest.raises(ValueError, match="not valid base64"):
             await service.executor.run(
-                lambda adapter: adapter.stage_inline_import("not base64!!", ".apkg")
+                # Rejected only by strict base64 validation, not by lenient decoding.
+                lambda adapter: adapter.stage_inline_import("aGVsbG8=!", ".apkg")
             )
         with pytest.raises(ValueError, match="non-empty"):
             await service.executor.run(
@@ -841,8 +842,32 @@ async def test_stage_inline_import_is_content_addressed_and_idempotent(
 
 
 @pytest.mark.anyio
+async def test_stage_inline_import_overwrites_stale_content_addressed_file(
+    tmp_path: Path,
+) -> None:
+    data = b"fresh bytes"
+    content = base64.b64encode(data).decode("ascii")
+    expected = f"inline-{hashlib.sha256(data).hexdigest()}.apkg"
+
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+    imports = _imports_dir(target)
+    (imports / expected).write_bytes(b"STALE")
+
+    async with AnkiCollectionService(str(target), max_page_size=100) as service:
+        staged = await service.executor.run(
+            lambda adapter: adapter.stage_inline_import(content, ".apkg")
+        )
+
+    assert staged == expected
+    assert (imports / expected).read_bytes() == data
+
+
+@pytest.mark.anyio
 async def test_stage_inline_import_enforces_size_cap(tmp_path: Path) -> None:
-    content = base64.b64encode(b"too big").decode("ascii")
+    at_limit = base64.b64encode(b"four").decode("ascii")
+    over = base64.b64encode(b"too big").decode("ascii")
     target = tmp_path / "target" / "collection.anki2"
     target.parent.mkdir(parents=True)
     _empty_collection(target)
@@ -850,9 +875,13 @@ async def test_stage_inline_import_enforces_size_cap(tmp_path: Path) -> None:
     async with AnkiCollectionService(
         str(target), max_page_size=100, max_import_bytes=4
     ) as service:
+        staged = await service.executor.run(
+            lambda adapter: adapter.stage_inline_import(at_limit, ".csv")
+        )
+        assert staged == f"inline-{hashlib.sha256(b'four').hexdigest()}.csv"
         with pytest.raises(ResourceLimitError, match="ANKI_MAX_IMPORT_BYTES"):
             await service.executor.run(
-                lambda adapter: adapter.stage_inline_import(content, ".csv")
+                lambda adapter: adapter.stage_inline_import(over, ".csv")
             )
 
 
@@ -1046,6 +1075,12 @@ def test_app_inline_import_requires_exactly_one_source(
         assert csv_neither.get("isError") is True
         assert "INVALID_ARGUMENT" in csv_neither["content"][0]["text"]
 
+        malformed = _call(
+            client, headers, 5, "anki_import_apkg_preview", {"content_base64": "aGVsbG8=!"}
+        )
+        assert malformed.get("isError") is True
+        assert "INVALID_ARGUMENT" in malformed["content"][0]["text"]
+
 
 def test_app_inline_apkg_token_binds_content(
     source_collection: tuple[str, int], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1091,5 +1126,70 @@ def test_app_inline_apkg_token_binds_content(
         assert refused.get("isError") is True
         assert "DESTRUCTIVE_CONFIRMATION_REQUIRED" in refused["content"][0]["text"]
 
-    assert Collection(str(target)).note_count() == 0
+    collection = Collection(str(target))
+    try:
+        assert collection.note_count() == 0
+    finally:
+        collection.close()
 
+
+def test_app_inline_csv_import_stages_and_applies(
+    source_collection: tuple[str, int], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, deck_id = source_collection
+    _, csv = asyncio.run(_export_fixtures(source, deck_id))
+    content = base64.b64encode(Path(csv["path"]).read_bytes()).decode("ascii")
+    staged = f"inline-{csv['sha256']}.csv"
+
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+
+    collection = Collection(str(target))
+    try:
+        notetype_id = int(collection.models.by_name("Basic")["id"])
+        deck = int(collection.decks.id("Imported"))
+    finally:
+        collection.close()
+
+    settings = _import_settings(target, monkeypatch)
+    with TestClient(create_app(settings)) as client:
+        headers = _initialize(client)
+
+        preview = _payload(
+            _call(
+                client,
+                headers,
+                2,
+                "anki_import_csv_preview",
+                {"content_base64": content, "delimiter": "\t"},
+            )
+        )
+        assert preview["impact"]["filename"] == staged
+
+        applied = _payload(
+            _call(
+                client,
+                headers,
+                3,
+                "anki_import_csv",
+                {
+                    "content_base64": content,
+                    "notetype_id": notetype_id,
+                    "field_columns": [1, 2],
+                    "deck_id": deck,
+                    "delimiter": "\t",
+                    "is_html": True,
+                    "confirmation_token": preview["confirmation_token"],
+                    "idempotency_key": "inline-csv-1",
+                },
+            )
+        )
+        assert applied["state"] == "committed"
+        assert applied["result"]["notes_added"] == 2
+
+    collection = Collection(str(target))
+    try:
+        assert collection.note_count() == 2
+    finally:
+        collection.close()
