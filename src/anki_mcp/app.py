@@ -2020,9 +2020,28 @@ def create_app(settings: Settings) -> ASGIApp:
     @scoped_tool(name="anki_undo_status", scope="read")
     async def undo_status() -> dict[str, Any]:
         """Report the in-memory undo and redo stack heads for the running collection process."""
-        return await execute(service.coordinated_read(lambda adapter: adapter.undo_status()))
+        result = await execute(service.coordinated_read(lambda adapter: adapter.undo_status()))
+        if not isinstance(result, dict):  # pragma: no cover - adapter always returns a mapping
+            raise RuntimeError("undo status returned an invalid result")
+        if settings.sync_on_write:
+            result["disabled_reason"] = (
+                "undo and redo are unavailable while ANKI_SYNC_ON_WRITE is enabled, because "
+                "every synchronization clears Anki's in-memory undo history; set "
+                "ANKI_SYNC_ON_WRITE=false to use them"
+            )
+        elif not settings.allow_undo:
+            result["disabled_reason"] = (
+                "undo and redo are not registered because ANKI_ALLOW_UNDO is disabled"
+            )
+        else:
+            result["disabled_reason"] = None
+        return result
 
-    @scoped_tool(name="anki_undo", scope="destructive", enabled=settings.allow_undo)
+    @scoped_tool(
+        name="anki_undo",
+        scope="destructive",
+        enabled=settings.allow_undo and not settings.sync_on_write,
+    )
     async def undo(
         expect_operation: OperationName, idempotency_key: IdempotencyKey
     ) -> dict[str, Any]:
@@ -2034,7 +2053,11 @@ def create_app(settings: Settings) -> ASGIApp:
             lambda adapter: adapter.undo(expect_operation),
         )
 
-    @scoped_tool(name="anki_redo", scope="destructive", enabled=settings.allow_undo)
+    @scoped_tool(
+        name="anki_redo",
+        scope="destructive",
+        enabled=settings.allow_undo and not settings.sync_on_write,
+    )
     async def redo(
         expect_operation: OperationName, idempotency_key: IdempotencyKey
     ) -> dict[str, Any]:

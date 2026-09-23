@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from anki.collection import Collection
@@ -102,13 +104,16 @@ async def test_replayed_undo_returns_receipt_without_undoing_again(
             await service.get_note(note_id)
 
 
-def _tool_names(path: Path, *, allow_undo: bool, scopes: str) -> list[str]:
+def _tool_names(
+    path: Path, *, allow_undo: bool, scopes: str, sync_on_write: bool = False
+) -> list[str]:
     settings = Settings(
         _env_file=None,
         MCP_AUTH_TOKEN="test-token",
         ANKI_COLLECTION_PATH=str(path),
         MCP_SCOPES=scopes,
         ANKI_ALLOW_UNDO="true" if allow_undo else "false",
+        ANKI_SYNC_ON_WRITE="true" if sync_on_write else "false",
     )
     headers = {
         "Authorization": "Bearer test-token",
@@ -153,3 +158,71 @@ def test_undo_tools_require_flag_and_destructive_scope(tmp_path: Path) -> None:
 
     no_scope = _tool_names(path, allow_undo=True, scopes="read,write,admin")
     assert "anki_undo" not in no_scope
+
+
+def test_undo_tools_are_not_registered_while_sync_on_write_is_enabled(tmp_path: Path) -> None:
+    path = tmp_path / "collection.anki2"
+    Collection(str(path)).close()
+
+    syncing = _tool_names(
+        path, allow_undo=True, scopes="read,write,admin,destructive", sync_on_write=True
+    )
+    assert "anki_undo_status" in syncing
+    assert "anki_undo" not in syncing
+    assert "anki_redo" not in syncing
+
+
+def test_undo_status_reports_disabled_reason(tmp_path: Path) -> None:
+    path = tmp_path / "collection.anki2"
+    Collection(str(path)).close()
+
+    def status(
+        *, allow_undo: bool, sync_on_write: bool, scopes: str = "read,write,admin,destructive"
+    ) -> dict[str, Any]:
+        settings = Settings(
+            _env_file=None,
+            MCP_AUTH_TOKEN="test-token",
+            ANKI_COLLECTION_PATH=str(path),
+            MCP_SCOPES=scopes,
+            ANKI_ALLOW_UNDO="true" if allow_undo else "false",
+            ANKI_SYNC_ON_WRITE="true" if sync_on_write else "false",
+        )
+        headers = {
+            "Authorization": "Bearer test-token",
+            "Accept": "application/json, text/event-stream",
+        }
+        with TestClient(create_app(settings)) as client:
+            initialized = client.post(
+                "/mcp",
+                headers=headers,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "clientInfo": {"name": "pytest", "version": "1"},
+                    },
+                },
+            )
+            headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+            called = client.post(
+                "/mcp",
+                headers=headers,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "anki_undo_status", "arguments": {}},
+                },
+            )
+            result = called.json()["result"]
+            assert result.get("isError") is not True, result
+            return json.loads(result["content"][0]["text"])
+
+    syncing = status(allow_undo=True, sync_on_write=True)
+    assert "ANKI_SYNC_ON_WRITE" in syncing["disabled_reason"]
+    flagged_off = status(allow_undo=False, sync_on_write=False)
+    assert "ANKI_ALLOW_UNDO" in flagged_off["disabled_reason"]
+    assert status(allow_undo=True, sync_on_write=False)["disabled_reason"] is None
