@@ -35,6 +35,8 @@ from anki.errors import (
     NetworkError,
     NotFoundError,
     SearchError,
+    SyncError,
+    SyncErrorKind,
     UndoEmpty,
 )
 from anki.import_export_pb2 import (
@@ -257,6 +259,13 @@ class CollectionAdapter:
         self._last_media_sync_at = status.get("last_media_sync_at")
         self._media_sync_progress = status.get("media_sync_progress")
         self._post_restore_upload = bool(status.get("post_restore_upload", False))
+        next_required = status.get("next_sync_required")
+        self._next_sync_required = next_required if isinstance(next_required, str) else None
+        session_valid = status.get("sync_session_valid")
+        self._sync_session_valid = session_valid if isinstance(session_valid, bool) else None
+        self._sync_session_checked_at = status.get("sync_session_checked_at")
+        last_sync_error = status.get("last_sync_error")
+        self._last_sync_error = last_sync_error if isinstance(last_sync_error, dict) else None
 
     def close(self) -> None:
         try:
@@ -290,17 +299,66 @@ class CollectionAdapter:
                 "media_sync_progress": self._media_sync_progress,
                 "pending_full_sync": pending,
                 "post_restore_upload": self._post_restore_upload,
+                "next_sync_required": self._next_sync_required,
+                "sync_session_valid": self._sync_session_valid,
+                "sync_session_checked_at": self._sync_session_checked_at,
+                "last_sync_error": self._last_sync_error,
             }
         )
 
     def _invalidate_sync_auth(self) -> None:
         self._sync_auth = None
         self._configured_sync_endpoint = None
-        self._pending_full_sync = None
         self._state.clear_sync_auth()
         self._save_operational_status()
 
-    def status(self) -> dict[str, Any]:
+    def _classify_sync_failure(self, exc: BaseException) -> str:
+        if isinstance(exc, MediaSyncFailedError):
+            return "MEDIA"
+        if isinstance(exc, (NetworkError, TimeoutError)):
+            return "NETWORK"
+        if isinstance(exc, SyncError) and exc.kind == SyncErrorKind.AUTH:
+            return "AUTH"
+        return "SYNC"
+
+    def _record_sync_failure(self, exc: BaseException) -> str:
+        kind = self._classify_sync_failure(exc)
+        message, _ = self._truncate_rendered(str(exc))
+        self._last_sync_error = {
+            "kind": kind,
+            "message": message,
+            "at": datetime.now(UTC).isoformat(),
+        }
+        return kind
+
+    def _probe_sync_session(self) -> None:
+        """Read-only server check that records the session state without raising."""
+        if self._sync_auth is None:
+            return
+        try:
+            required = self.collection.sync_status(self._sync_auth).required
+        except Exception as exc:
+            if self._record_sync_failure(exc) == "AUTH":
+                self._sync_session_valid = False
+                self._invalidate_sync_auth()
+            else:
+                self._sync_session_valid = None
+                self._save_operational_status()
+            return
+        name = SYNC_REQUIRED_NAMES[required]
+        self._sync_session_valid = True
+        self._next_sync_required = name
+        self._sync_session_checked_at = datetime.now(UTC).isoformat()
+        self._last_sync_error = None
+        if required in {2, 3, 4}:
+            self._pending_full_sync = (required, None)
+        else:
+            self._pending_full_sync = None
+        self._save_operational_status()
+
+    def status(self, check_server: bool = False) -> dict[str, Any]:
+        if check_server:
+            self._probe_sync_session()
         collection_ready = self.check_ready()
         pending_name = (
             SYNC_REQUIRED_NAMES[self._pending_full_sync[0]]
@@ -308,10 +366,15 @@ class CollectionAdapter:
             else None
         )
         authenticated = self._sync_auth is not None
-        ready = collection_ready and authenticated and pending_name is None
+        full_required = pending_name is not None or self._next_sync_required in {
+            "FULL_SYNC",
+            "FULL_DOWNLOAD",
+            "FULL_UPLOAD",
+        }
+        ready = collection_ready and authenticated and not full_required
         if not collection_ready:
             reason = "collection_unavailable"
-        elif pending_name is not None:
+        elif full_required:
             reason = "full_sync_required"
         elif not authenticated:
             reason = "authentication_required"
@@ -324,6 +387,10 @@ class CollectionAdapter:
             "ready": ready,
             "readiness_reason": reason,
             "pending_full_sync": pending_name,
+            "next_sync_required": self._next_sync_required,
+            "sync_session_valid": self._sync_session_valid,
+            "sync_session_checked_at": self._sync_session_checked_at,
+            "last_sync_error": self._last_sync_error,
             "post_restore_upload_pending": bool(self._post_restore_upload),
             "last_sync_at": self._last_sync_at,
             "last_media_sync_at": self._last_media_sync_at,
@@ -569,6 +636,9 @@ class CollectionAdapter:
                     message += "; the sidecar must be restarted before further use"
                 raise RestoreFailedError(message) from exc
         self._pending_full_sync = None
+        # The collection was replaced, so any previously observed requirement is void.
+        self._next_sync_required = None
+        self._last_sync_error = None
         self._state.mark_pending_discarded_by_restore()
         self._post_restore_upload = True
         self._save_operational_status()
@@ -762,6 +832,8 @@ class CollectionAdapter:
                 if media_pending:
                     receipt["media_synced"] = True
                 receipt["retryable"] = False
+                receipt["sync_error"] = None
+                receipt["sync_required"] = None
                 self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
             audit(receipt)
             return receipt
@@ -805,13 +877,19 @@ class CollectionAdapter:
         if sync_after and self.sync_on_write:
             try:
                 self._sync_or_raise_full_sync(sync_media=sync_media)
-            except FullSyncRequiredError:
+            except FullSyncRequiredError as exc:
+                requirement = self._next_sync_required
                 receipt["remote_synced"] = False
+                receipt["retryable"] = True
+                receipt["sync_required"] = requirement
                 self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
-                raise
+                raise FullSyncRequiredError(
+                    self._full_sync_required_receipt_message(idempotency_key, requirement)
+                ) from exc
             except Exception:
                 receipt["remote_synced"] = False
                 receipt["retryable"] = True
+                receipt["sync_error"] = self._last_sync_error
                 self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
                 audit(receipt)
                 return receipt
@@ -829,6 +907,25 @@ class CollectionAdapter:
                 f"{result['required']} requires operator-controlled full synchronization"
             )
         return result
+
+    @staticmethod
+    def _full_sync_required_receipt_message(
+        idempotency_key: str, requirement: str | None
+    ) -> str:
+        if requirement == "FULL_DOWNLOAD":
+            action = "anki_sync_full_download(confirm=true)"
+        elif requirement == "FULL_UPLOAD":
+            action = "anki_sync_full_upload(confirm=true)"
+        else:
+            action = (
+                "anki_sync_full_upload(confirm=true) or anki_sync_full_download(confirm=true)"
+            )
+        return (
+            f"the local mutation was applied but the remote server requires "
+            f"{requirement or 'a full synchronization'}; it is recorded under idempotency "
+            f"key {idempotency_key} and will not be re-applied — run "
+            f"anki_status(check_server=true), then {action}"
+        )
 
     def _page(self, values: list[Any], offset: int, limit: int) -> dict[str, Any]:
         if offset < 0:
@@ -3440,7 +3537,6 @@ class CollectionAdapter:
     def sync_login(self, username: str, password: str, endpoint: str | None) -> dict[str, Any]:
         self._sync_auth = None
         self._configured_sync_endpoint = None
-        self._pending_full_sync = None
         self._state.clear_sync_auth()
         self._save_operational_status()
         self._sync_auth = self.collection.sync_login(username, password, endpoint)
@@ -3501,6 +3597,10 @@ class CollectionAdapter:
                 self._pending_full_sync = None
             self._last_sync_at = datetime.now(UTC).isoformat()
             required = SYNC_REQUIRED_NAMES[output.required]
+            self._next_sync_required = required
+            self._sync_session_valid = True
+            self._sync_session_checked_at = datetime.now(UTC).isoformat()
+            self._last_sync_error = None
             if self._post_restore_upload and required in {"NO_CHANGES", "NORMAL_SYNC"}:
                 self._post_restore_upload = False
             self._state.save_sync_auth(
@@ -3525,8 +3625,11 @@ class CollectionAdapter:
                 "endpoint_changed": endpoint_changed,
             }
         except Exception as exc:
+            kind = self._record_sync_failure(exc)
+            self._sync_session_valid = False if kind == "AUTH" else None
             if not isinstance(exc, (NetworkError, TimeoutError)):
                 self._invalidate_sync_auth()
+            self._save_operational_status()
             raise
 
     def full_sync(self, upload: bool, force: bool = False) -> dict[str, Any]:
@@ -3563,6 +3666,10 @@ class CollectionAdapter:
                 self._invalidate_sync_auth()
             raise
         self._pending_full_sync = None
+        self._next_sync_required = None
+        self._last_sync_error = None
+        self._sync_session_valid = True
+        self._sync_session_checked_at = datetime.now(UTC).isoformat()
         self._post_restore_upload = False
         self._last_sync_at = datetime.now(UTC).isoformat()
         if upload:
@@ -4655,8 +4762,8 @@ class AnkiCollectionService:
             )
         )
 
-    async def status(self) -> dict[str, Any]:
-        return await self.executor.run(lambda adapter: adapter.status())
+    async def status(self, check_server: bool = False) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.status(check_server))
 
     async def get_operation(self, idempotency_key: str) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.get_operation(idempotency_key))

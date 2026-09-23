@@ -656,9 +656,13 @@ def create_app(settings: Settings) -> ASGIApp:
         )
 
     @scoped_tool(name="anki_status", scope="read")
-    async def status() -> dict[str, Any]:
-        """Return actionable local collection, authentication, sync, and recovery status."""
-        return await execute(service.status())
+    async def status(check_server: StrictBool = False) -> dict[str, Any]:
+        """Return actionable local collection, authentication, sync, and recovery status.
+
+        check_server makes one read-only server request and may take up to the sync
+        timeout; it reports the requirement the next write would face.
+        """
+        return await execute(service.status(check_server))
 
     @scoped_tool(name="anki_operations_list", scope="read")
     async def operations_list(
