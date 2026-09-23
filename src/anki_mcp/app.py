@@ -2154,7 +2154,7 @@ def create_app(settings: Settings) -> ASGIApp:
         enabled=settings.allow_destructive,
     )
     async def maintenance_optimize_preview() -> dict[str, Any]:
-        """Preview collection counts and on-disk size before optimizing the database."""
+        """Preview collection counts before optimizing the database."""
         request: dict[str, Any] = {}
         return await preview(
             "anki_maintenance_optimize",
@@ -2171,7 +2171,10 @@ def create_app(settings: Settings) -> ASGIApp:
         confirmation_token: ConfirmationToken,
         idempotency_key: IdempotencyKey | None = None,
     ) -> dict[str, Any]:
-        """Vacuum and analyze the collection database after a matching size preview."""
+        """Vacuum and analyze the collection database after a matching count preview.
+
+        The apply reports the logical database size before and after optimizing.
+        """
         request: dict[str, Any] = {}
         return await guarded_mutate(
             "anki_maintenance_optimize",
