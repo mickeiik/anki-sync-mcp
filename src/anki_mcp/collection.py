@@ -3597,6 +3597,47 @@ class CollectionAdapter:
             )
         return path
 
+    def stage_inline_import(self, content_base64: str, suffix: str) -> str:
+        """Decode inline bytes into the imports folder under a content-derived name."""
+        try:
+            data = base64.b64decode(content_base64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("content_base64 is not valid base64") from exc
+        if not data:
+            raise ValueError("content_base64 must decode to a non-empty file")
+        if len(data) > self.max_import_bytes:
+            raise ResourceLimitError(
+                f"inline import exceeds ANKI_MAX_IMPORT_BYTES ({self.max_import_bytes})"
+            )
+        digest = hashlib.sha256(data).hexdigest()
+        filename = f"inline-{digest}{suffix}"
+        path = self._imports_folder / filename
+        if path.is_symlink():
+            raise ValueError("import filename must not reference a symbolic link")
+        if path.is_file():
+            with path.open("rb") as handle:
+                if hashlib.file_digest(handle, "sha256").hexdigest() == digest:
+                    return filename
+        temp_path = self._imports_folder / f".{filename}.{uuid4().hex}.tmp"
+        try:
+            temp_path.write_bytes(data)
+            os.replace(temp_path, path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+        return filename
+
+    def resolve_import_source(
+        self, filename: str | None, content_base64: str | None, suffix: str
+    ) -> str:
+        """Return the staged filename for exactly one of filename / inline content."""
+        if content_base64 is not None:
+            if filename is not None:
+                raise ValueError("provide exactly one of filename or content_base64")
+            return self.stage_inline_import(content_base64, suffix)
+        if filename is not None:
+            return filename
+        raise ValueError("provide exactly one of filename or content_base64")
+
     def list_import_files(self, offset: int, limit: int) -> dict[str, Any]:
         items: list[dict[str, Any]] = []
         if self._imports_folder.is_dir():
@@ -4303,6 +4344,13 @@ class AnkiCollectionService:
 
     async def list_import_files(self, offset: int, limit: int) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.list_import_files(offset, limit))
+
+    async def resolve_import_source(
+        self, filename: str | None, content_base64: str | None, suffix: str
+    ) -> str:
+        return await self.executor.run(
+            lambda adapter: adapter.resolve_import_source(filename, content_base64, suffix)
+        )
 
     async def preview_import_apkg(self, filename: str) -> dict[str, Any]:
         return await self.executor.run(

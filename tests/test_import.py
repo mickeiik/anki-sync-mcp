@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import io
 import json
 import os
@@ -790,3 +792,304 @@ def test_apkg_with_unsupported_compression_is_a_clean_file_error(tmp_path: Path)
                 await service.get_operation("crafted-key")
 
     asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------------------
+# inline content_base64 staging and round trips
+# --------------------------------------------------------------------------------------
+
+
+def _valid_apkg_bytes() -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("meta", b"{}")
+        archive.writestr("collection.anki2", b"collection-bytes")
+    return buffer.getvalue()
+
+
+@pytest.mark.anyio
+async def test_stage_inline_import_is_content_addressed_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    data = b"hello apkg"
+    content = base64.b64encode(data).decode("ascii")
+    expected = f"inline-{hashlib.sha256(data).hexdigest()}.apkg"
+
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+    imports = _imports_dir(target)
+
+    async with AnkiCollectionService(str(target), max_page_size=100) as service:
+        first = await service.executor.run(
+            lambda adapter: adapter.stage_inline_import(content, ".apkg")
+        )
+        second = await service.executor.run(
+            lambda adapter: adapter.stage_inline_import(content, ".apkg")
+        )
+        with pytest.raises(ValueError, match="not valid base64"):
+            await service.executor.run(
+                lambda adapter: adapter.stage_inline_import("not base64!!", ".apkg")
+            )
+        with pytest.raises(ValueError, match="non-empty"):
+            await service.executor.run(
+                lambda adapter: adapter.stage_inline_import("", ".apkg")
+            )
+
+    assert first == second == expected
+    assert [path.name for path in imports.iterdir()] == [expected]
+
+
+@pytest.mark.anyio
+async def test_stage_inline_import_enforces_size_cap(tmp_path: Path) -> None:
+    content = base64.b64encode(b"too big").decode("ascii")
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+
+    async with AnkiCollectionService(
+        str(target), max_page_size=100, max_import_bytes=4
+    ) as service:
+        with pytest.raises(ResourceLimitError, match="ANKI_MAX_IMPORT_BYTES"):
+            await service.executor.run(
+                lambda adapter: adapter.stage_inline_import(content, ".csv")
+            )
+
+
+@pytest.mark.anyio
+async def test_stage_inline_import_rejects_symlink_target(tmp_path: Path) -> None:
+    data = b"payload"
+    content = base64.b64encode(data).decode("ascii")
+    digest = hashlib.sha256(data).hexdigest()
+
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+    imports = _imports_dir(target)
+    outside = tmp_path / "outside.apkg"
+    outside.write_bytes(b"x")
+    (imports / f"inline-{digest}.apkg").symlink_to(outside)
+
+    async with AnkiCollectionService(str(target), max_page_size=100) as service:
+        with pytest.raises(ValueError, match="symbolic link"):
+            await service.executor.run(
+                lambda adapter: adapter.stage_inline_import(content, ".apkg")
+            )
+
+
+@pytest.mark.anyio
+async def test_inline_apkg_round_trip(
+    source_collection: tuple[str, int], tmp_path: Path
+) -> None:
+    source, deck_id = source_collection
+    apkg, _ = await _export_fixtures(source, deck_id)
+    content = base64.b64encode(Path(apkg["path"]).read_bytes()).decode("ascii")
+
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+
+    async with AnkiCollectionService(str(target), max_page_size=100) as service:
+        filename = await service.resolve_import_source(None, content, ".apkg")
+        assert filename == f"inline-{apkg['sha256']}.apkg"
+
+        preview = await service.preview_import_apkg(filename)
+        assert preview["validated"] is True
+        assert preview["sha256"] == apkg["sha256"]
+
+        result = await service.import_apkg(filename, True, 2, 2, True, False)
+        searched = await service.search_notes("", 0, 100)
+        field_tuples = await _field_tuples(service)
+
+    assert result["notes_added"] == 2
+    assert {note["first_field"] for note in searched["items"]} == {"front-a1", "front-a2"}
+    assert field_tuples == {("front-a1", "back-a1"), ("front-a2", "back-a2")}
+
+
+@pytest.mark.anyio
+async def test_inline_csv_round_trip(
+    source_collection: tuple[str, int], tmp_path: Path
+) -> None:
+    source, deck_id = source_collection
+    _, csv = await _export_fixtures(source, deck_id)
+    content = base64.b64encode(Path(csv["path"]).read_bytes()).decode("ascii")
+
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+
+    collection = Collection(str(target))
+    try:
+        notetype_id = int(collection.models.by_name("Basic")["id"])
+        deck = int(collection.decks.id("Imported"))
+    finally:
+        collection.close()
+
+    async with AnkiCollectionService(str(target), max_page_size=100) as service:
+        filename = await service.resolve_import_source(None, content, ".csv")
+        assert filename == f"inline-{csv['sha256']}.csv"
+
+        preview = await service.preview_import_csv(filename, "\t")
+        assert preview["delimiter"] == "\t"
+        assert preview["sample_rows"][0][:2] == ["front-a1", "back-a1"]
+
+        result = await service.import_csv(
+            filename, notetype_id, [1, 2], deck, "\t", True, [], "preserve"
+        )
+        field_tuples = await _field_tuples(service)
+
+    assert result["notes_added"] == 2
+    assert field_tuples == {("front-a1", "back-a1"), ("front-a2", "back-a2")}
+
+
+def test_app_inline_apkg_import_stages_and_reuses_filename(
+    source_collection: tuple[str, int], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, deck_id = source_collection
+    apkg, _ = asyncio.run(_export_fixtures(source, deck_id))
+    content = base64.b64encode(Path(apkg["path"]).read_bytes()).decode("ascii")
+    staged = f"inline-{apkg['sha256']}.apkg"
+
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+
+    settings = _import_settings(target, monkeypatch)
+    with TestClient(create_app(settings)) as client:
+        headers = _initialize(client)
+
+        preview = _payload(
+            _call(
+                client,
+                headers,
+                2,
+                "anki_import_apkg_preview",
+                {"content_base64": content},
+            )
+        )
+        assert preview["impact"]["filename"] == staged
+
+        applied = _payload(
+            _call(
+                client,
+                headers,
+                3,
+                "anki_import_apkg",
+                {
+                    "content_base64": content,
+                    "confirmation_token": preview["confirmation_token"],
+                    "idempotency_key": "inline-apkg-1",
+                },
+            )
+        )
+        assert applied["state"] == "committed"
+        assert applied["result"]["notes_added"] == 2
+        assert Path(applied["result"]["backup"]["path"]).is_file()
+
+        # The staged content-derived name flows through the unchanged filename pipeline.
+        filename_preview = _payload(
+            _call(client, headers, 4, "anki_import_apkg_preview", {"filename": staged})
+        )
+        assert filename_preview["impact"]["filename"] == staged
+        filename_applied = _payload(
+            _call(
+                client,
+                headers,
+                5,
+                "anki_import_apkg",
+                {
+                    "filename": staged,
+                    "confirmation_token": filename_preview["confirmation_token"],
+                    "idempotency_key": "inline-apkg-2",
+                },
+            )
+        )
+        assert filename_applied["state"] == "committed"
+
+    collection = Collection(str(target))
+    try:
+        assert collection.note_count() == 2
+    finally:
+        collection.close()
+
+
+def test_app_inline_import_requires_exactly_one_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+    imports = _imports_dir(target)
+    raw = _valid_apkg_bytes()
+    (imports / "staged.apkg").write_bytes(raw)
+    content = base64.b64encode(raw).decode("ascii")
+
+    settings = _import_settings(target, monkeypatch)
+    with TestClient(create_app(settings)) as client:
+        headers = _initialize(client)
+
+        both = _call(
+            client,
+            headers,
+            2,
+            "anki_import_apkg_preview",
+            {"filename": "staged.apkg", "content_base64": content},
+        )
+        assert both.get("isError") is True
+        assert "INVALID_ARGUMENT" in both["content"][0]["text"]
+
+        neither = _call(client, headers, 3, "anki_import_apkg_preview", {})
+        assert neither.get("isError") is True
+        assert "INVALID_ARGUMENT" in neither["content"][0]["text"]
+
+        csv_neither = _call(client, headers, 4, "anki_import_csv_preview", {})
+        assert csv_neither.get("isError") is True
+        assert "INVALID_ARGUMENT" in csv_neither["content"][0]["text"]
+
+
+def test_app_inline_apkg_token_binds_content(
+    source_collection: tuple[str, int], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, deck_id = source_collection
+    apkg, _ = asyncio.run(_export_fixtures(source, deck_id))
+    content_a = base64.b64encode(Path(apkg["path"]).read_bytes()).decode("ascii")
+    # A second, structurally valid package whose bytes (and thus preview impact) differ.
+    buffer = io.BytesIO(Path(apkg["path"]).read_bytes())
+    with zipfile.ZipFile(buffer, "a") as archive:
+        archive.writestr("extra.txt", "x")
+    content_b = base64.b64encode(buffer.getvalue()).decode("ascii")
+    assert content_a != content_b
+
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+
+    settings = _import_settings(target, monkeypatch)
+    with TestClient(create_app(settings)) as client:
+        headers = _initialize(client)
+
+        preview = _payload(
+            _call(
+                client,
+                headers,
+                2,
+                "anki_import_apkg_preview",
+                {"content_base64": content_a},
+            )
+        )
+        refused = _call(
+            client,
+            headers,
+            3,
+            "anki_import_apkg",
+            {
+                "content_base64": content_b,
+                "confirmation_token": preview["confirmation_token"],
+                "idempotency_key": "inline-diff-1",
+            },
+        )
+        assert refused.get("isError") is True
+        assert "DESTRUCTIVE_CONFIRMATION_REQUIRED" in refused["content"][0]["text"]
+
+    assert Collection(str(target)).note_count() == 0
+

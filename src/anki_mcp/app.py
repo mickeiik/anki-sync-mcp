@@ -66,6 +66,7 @@ RestoreMode = Literal["upload_now", "local_only"]
 CsvDupeResolution = Literal["preserve", "update", "duplicate"]
 UpdateCondition = Literal["ALWAYS", "IF_NEWER", "NEVER"]
 MediaContent = Annotated[StrictStr, Field(min_length=1, max_length=22_369_624)]
+InlineImportContent = Annotated[StrictStr, Field(min_length=1, max_length=22_369_624)]
 StableIds = Annotated[list[StableId], Field(min_length=1, max_length=500)]
 NonNegativeInt = Annotated[StrictInt, Field(ge=0)]
 CsvFieldColumns = Annotated[list[NonNegativeInt], Field(max_length=1000)]
@@ -2082,14 +2083,26 @@ def create_app(settings: Settings) -> ASGIApp:
         ),
     )
     async def import_apkg_preview(
-        filename: ImportFilename,
+        filename: ImportFilename | None = None,
+        content_base64: InlineImportContent | None = None,
         merge_notetypes: StrictBool = False,
         update_notes: UpdateCondition = "NEVER",
         update_notetypes: UpdateCondition = "NEVER",
         with_scheduling: StrictBool = True,
         with_deck_configs: StrictBool = False,
     ) -> dict[str, Any]:
-        """Validate a staged .apkg and preview its import; issues a confirmation token."""
+        """Validate an .apkg and preview its import; issues a confirmation token.
+
+        Supply exactly one of ``filename`` (a file already staged in the imports
+        folder) or ``content_base64`` (the package bytes inline). Inline content is
+        staged under a content-derived name in the imports folder.
+        """
+        resolved = await execute(
+            service.resolve_import_source(filename, content_base64, ".apkg")
+        )
+        if not isinstance(resolved, str):  # pragma: no cover - resolver returns a filename
+            raise RuntimeError("import source resolution returned an invalid result")
+        filename = resolved
         request = {
             "filename": filename,
             "merge_notetypes": merge_notetypes,
@@ -2112,16 +2125,28 @@ def create_app(settings: Settings) -> ASGIApp:
         ),
     )
     async def import_apkg(
-        filename: ImportFilename,
         confirmation_token: ConfirmationToken,
         idempotency_key: IdempotencyKey,
+        filename: ImportFilename | None = None,
+        content_base64: InlineImportContent | None = None,
         merge_notetypes: StrictBool = False,
         update_notes: UpdateCondition = "NEVER",
         update_notetypes: UpdateCondition = "NEVER",
         with_scheduling: StrictBool = True,
         with_deck_configs: StrictBool = False,
     ) -> dict[str, Any]:
-        """Import a staged .apkg after a matching preview token and verified backup."""
+        """Import an .apkg after a matching preview token and verified backup.
+
+        Supply exactly one of ``filename`` or ``content_base64`` (see
+        ``anki_import_apkg_preview``); inline content is staged under a
+        content-derived name in the imports folder.
+        """
+        resolved = await execute(
+            service.resolve_import_source(filename, content_base64, ".apkg")
+        )
+        if not isinstance(resolved, str):  # pragma: no cover - resolver returns a filename
+            raise RuntimeError("import source resolution returned an invalid result")
+        filename = resolved
         request = {
             "filename": filename,
             "merge_notetypes": merge_notetypes,
@@ -2153,9 +2178,21 @@ def create_app(settings: Settings) -> ASGIApp:
         enabled=settings.allow_import,
     )
     async def import_csv_preview(
-        filename: ImportFilename, delimiter: CsvDelimiter | None = None
+        filename: ImportFilename | None = None,
+        content_base64: InlineImportContent | None = None,
+        delimiter: CsvDelimiter | None = None,
     ) -> dict[str, Any]:
-        """Validate a staged .csv and preview its metadata and sample rows; issues a token."""
+        """Validate a .csv and preview its metadata and sample rows; issues a token.
+
+        Supply exactly one of ``filename`` or ``content_base64``; inline content is
+        staged under a content-derived name in the imports folder.
+        """
+        resolved = await execute(
+            service.resolve_import_source(filename, content_base64, ".csv")
+        )
+        if not isinstance(resolved, str):  # pragma: no cover - resolver returns a filename
+            raise RuntimeError("import source resolution returned an invalid result")
+        filename = resolved
         request = {"filename": filename, "delimiter": delimiter}
         return await preview(
             "anki_import_csv",
@@ -2169,23 +2206,32 @@ def create_app(settings: Settings) -> ASGIApp:
         enabled=settings.allow_import,
     )
     async def import_csv(
-        filename: ImportFilename,
         notetype_id: StableId,
         field_columns: CsvFieldColumns,
         deck_id: StableId,
         confirmation_token: ConfirmationToken,
         idempotency_key: IdempotencyKey,
+        filename: ImportFilename | None = None,
+        content_base64: InlineImportContent | None = None,
         delimiter: CsvDelimiter | None = None,
         is_html: StrictBool | None = None,
         tags: Tags | None = None,
         dupe_resolution: CsvDupeResolution = "preserve",
     ) -> dict[str, Any]:
-        """Import a staged .csv into a note type and deck after a matching preview token.
+        """Import a .csv into a note type and deck after a matching preview token.
 
-        The preview token binds the file identity (content digest) and delimiter; the
-        note type, field mapping, deck, tags, and duplicate resolution are chosen at
-        apply time. The same authenticated caller must perform both preview and apply.
+        Supply exactly one of ``filename`` or ``content_base64``; inline content is
+        staged under a content-derived name in the imports folder. The preview token
+        binds the file identity (content digest) and delimiter; the note type, field
+        mapping, deck, tags, and duplicate resolution are chosen at apply time. The
+        same authenticated caller must perform both preview and apply.
         """
+        resolved = await execute(
+            service.resolve_import_source(filename, content_base64, ".csv")
+        )
+        if not isinstance(resolved, str):  # pragma: no cover - resolver returns a filename
+            raise RuntimeError("import source resolution returned an invalid result")
+        filename = resolved
         normalized_tags = tags or []
         request = {
             "filename": filename,
