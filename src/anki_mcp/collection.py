@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -25,7 +26,7 @@ from anki.collection import AddNoteRequest, Collection, DeckIdLimit
 from anki.config_pb2 import ConfigKey
 from anki.consts import CARD_TYPE_REV, QUEUE_TYPE_SUSPENDED
 from anki.decks import UpdateDeckConfigs
-from anki.errors import InvalidInput, NetworkError, NotFoundError, SearchError
+from anki.errors import InvalidInput, NetworkError, NotFoundError, SearchError, UndoEmpty
 from anki.import_export_pb2 import ExportAnkiPackageOptions
 from anki.scheduler_pb2 import SimulateFsrsReviewRequest
 from anki.sync import SyncAuth
@@ -493,7 +494,7 @@ class CollectionAdapter:
         self._state.put_receipt(idempotency_key, operation, request_hash, intent)
         try:
             result = mutate(self)
-        except (ValueError, LookupError, BackupFailedError):
+        except (ValueError, LookupError, BackupFailedError, UndoEmpty):
             self._state.delete_receipt(idempotency_key)
             raise
         receipt: dict[str, Any] = {
@@ -3065,11 +3066,12 @@ class CollectionAdapter:
         if deck_id is None:
             return int(self.collection.card_count())
         self.get_deck(deck_id)
-        return len(self.collection.find_cards(f"did:{deck_id}"))
+        deck_ids = self.collection.decks.deck_and_child_ids(cast("DeckId", deck_id))
+        return sum(len(self.collection.find_cards(f"did:{int(did)}")) for did in deck_ids)
 
     def _require_within_export_bound(self, deck_id: int | None) -> None:
         if self._export_card_count(deck_id) > self.max_search_scan:
-            raise ValueError(
+            raise ResourceLimitError(
                 "export scope exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
             )
 
@@ -3091,12 +3093,14 @@ class CollectionAdapter:
         return filename, path
 
     def _export_result(self, filename: str, path: Path, extra: dict[str, Any]) -> dict[str, Any]:
-        content = path.read_bytes()
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            digest = hashlib.file_digest(handle, "sha256").hexdigest()
         return {
             "filename": filename,
             "path": str(path.resolve()),
-            "size_bytes": len(content),
-            "sha256": hashlib.sha256(content).hexdigest(),
+            "size_bytes": size,
+            "sha256": digest,
             **extra,
         }
 
@@ -3110,19 +3114,25 @@ class CollectionAdapter:
         """Export the collection (or one deck) to a generated ``.apkg`` file."""
         self._require_within_export_bound(deck_id)
         filename, path = self._new_export_path(".apkg")
-        exported_cards = int(
-            self.collection.export_anki_package(
-                out_path=str(path),
-                options=ExportAnkiPackageOptions(
-                    with_scheduling=include_scheduling,
-                    with_deck_configs=include_deck_configs,
-                    with_media=include_media,
-                    legacy=False,
-                ),
-                limit=DeckIdLimit(cast("DeckId", deck_id)) if deck_id is not None else None,
+        temp_path = path.with_name(f"{path.name}.{uuid4().hex[:8]}.tmp{path.suffix}")
+        try:
+            exported_notes = int(
+                self.collection.export_anki_package(
+                    out_path=str(temp_path),
+                    options=ExportAnkiPackageOptions(
+                        with_scheduling=include_scheduling,
+                        with_deck_configs=include_deck_configs,
+                        with_media=include_media,
+                        legacy=False,
+                    ),
+                    limit=DeckIdLimit(cast("DeckId", deck_id)) if deck_id is not None else None,
+                )
             )
-        )
-        return self._export_result(filename, path, {"exported_cards": exported_cards})
+            os.replace(temp_path, path)
+        except BaseException:
+            temp_path.unlink(missing_ok=True)
+            raise
+        return self._export_result(filename, path, {"exported_notes": exported_notes})
 
     def export_notes_csv(
         self,
@@ -3137,32 +3147,36 @@ class CollectionAdapter:
         """Export notes (whole collection or one deck) to a generated ``.csv`` file."""
         self._require_within_export_bound(deck_id)
         filename, path = self._new_export_path(".csv")
-        rows = int(
-            self.collection.export_note_csv(
-                out_path=str(path),
-                limit=DeckIdLimit(cast("DeckId", deck_id)) if deck_id is not None else None,
-                with_html=with_html,
-                with_tags=with_tags,
-                with_deck=with_deck,
-                with_notetype=with_notetype,
-                with_guid=with_guid,
+        temp_path = path.with_name(f"{path.name}.{uuid4().hex[:8]}.tmp{path.suffix}")
+        try:
+            rows = int(
+                self.collection.export_note_csv(
+                    out_path=str(temp_path),
+                    limit=DeckIdLimit(cast("DeckId", deck_id)) if deck_id is not None else None,
+                    with_html=with_html,
+                    with_tags=with_tags,
+                    with_deck=with_deck,
+                    with_notetype=with_notetype,
+                    with_guid=with_guid,
+                )
             )
-        )
-        content = path.read_bytes()
-        result = {
-            "filename": filename,
-            "path": str(path.resolve()),
-            "size_bytes": len(content),
-            "sha256": hashlib.sha256(content).hexdigest(),
-            "rows": rows,
-        }
+            os.replace(temp_path, path)
+        except BaseException:
+            temp_path.unlink(missing_ok=True)
+            raise
+        result = self._export_result(filename, path, {"rows": rows})
         if inline:
-            encoded = base64.b64encode(content)
-            if len(encoded) <= self.max_response_bytes - 8192:
-                result["content_base64"] = encoded.decode("ascii")
-            else:
+            size = int(result["size_bytes"])
+            if 4 * ((size + 2) // 3) + 1024 > self.max_response_bytes:
                 result["inline_omitted"] = True
-                result["inline_reason"] = "exceeds MCP_MAX_RESPONSE_BYTES"
+                result["inline_reason"] = "inline payload would exceed MCP_MAX_RESPONSE_BYTES"
+            else:
+                encoded = base64.b64encode(path.read_bytes())
+                if len(encoded) + 1024 <= self.max_response_bytes:
+                    result["content_base64"] = encoded.decode("ascii")
+                else:
+                    result["inline_omitted"] = True
+                    result["inline_reason"] = "inline payload would exceed MCP_MAX_RESPONSE_BYTES"
         return result
 
     def undo_status(self) -> dict[str, Any]:
