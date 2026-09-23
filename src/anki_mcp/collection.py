@@ -2153,16 +2153,38 @@ class CollectionAdapter:
             "state_fingerprint": self._impact_fingerprint(card_ids_by_note),
         }
 
-    def list_tags(self, offset: int, limit: int) -> dict[str, Any]:
+    def list_tags(
+        self, offset: int, limit: int, include_counts: bool = False
+    ) -> dict[str, Any]:
         tags = self.collection.tags.all()
         if len(tags) > self.max_search_scan:
             raise ValueError(
                 "collection exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
             )
-        items = []
+        counts: dict[str, int] | None = None
+        if include_counts:
+            if int(self.collection.note_count()) > self.max_search_scan:
+                raise ValueError(
+                    "collection exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
+                )
+            counts = {}
+            for note_id in self.collection.find_notes(""):
+                seen: set[str] = set()
+                for tag in self.collection.get_note(note_id).tags:
+                    parts = tag.split("::")
+                    for index in range(1, len(parts) + 1):
+                        ancestor = "::".join(parts[:index])
+                        if ancestor in seen:
+                            continue
+                        seen.add(ancestor)
+                        counts[ancestor] = counts.get(ancestor, 0) + 1
+        items: list[dict[str, Any]] = []
         for tag in sorted(tags, key=str.casefold):
             name, name_truncated = self._truncate_rendered(tag)
-            items.append({"name": name, "name_truncated": name_truncated})
+            item: dict[str, Any] = {"name": name, "name_truncated": name_truncated}
+            if counts is not None:
+                item["note_count"] = counts.get(tag, 0)
+            items.append(item)
         return self._page(items, offset, limit)
 
     def rename_tag(self, old_name: str, new_name: str) -> dict[str, Any]:
@@ -2209,6 +2231,71 @@ class CollectionAdapter:
             "notes": len(note_ids),
             "tag": name,
             "state_fingerprint": self._impact_fingerprint(sorted(note_ids)),
+        }
+
+    def _validate_tag_merge(self, source: str, target: str) -> None:
+        if not source.strip() or not target.strip():
+            raise ValueError("tag names must not be blank")
+        if source == target:
+            raise ValueError("source and target tags must differ")
+        if target.startswith(source + "::"):
+            raise ValueError("target must not be a child of source")
+        if source not in self.collection.tags.all():
+            raise LookupError(f"tag {source} not found")
+
+    def _scan_tag_merge(self, source: str, target: str) -> tuple[list[int], list[int]]:
+        prefix = source + "::"
+        affected: list[int] = []
+        duplicate_note_ids: list[int] = []
+        for note_id in self.collection.find_notes(""):
+            tags = self.collection.get_note(note_id).tags
+            if not any(tag == source or tag.startswith(prefix) for tag in tags):
+                continue
+            affected.append(int(note_id))
+            projected = [
+                target + tag[len(source) :] if tag == source or tag.startswith(prefix) else tag
+                for tag in tags
+            ]
+            if len(projected) != len(set(projected)):
+                duplicate_note_ids.append(int(note_id))
+        return affected, duplicate_note_ids
+
+    def preview_tag_merge(self, source: str, target: str) -> dict[str, Any]:
+        self._validate_tag_merge(source, target)
+        if int(self.collection.note_count()) > self.max_search_scan:
+            raise ValueError(
+                "collection exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
+            )
+        affected, duplicate_note_ids = self._scan_tag_merge(source, target)
+        return {
+            "source": source,
+            "target": target,
+            "notes": len(affected),
+            "duplicate_notes": len(duplicate_note_ids),
+            "state_fingerprint": self._impact_fingerprint(sorted(affected)),
+        }
+
+    def merge_tags(self, source: str, target: str) -> dict[str, Any]:
+        self._validate_tag_merge(source, target)
+        if int(self.collection.note_count()) > self.max_search_scan:
+            raise ValueError(
+                "collection exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
+            )
+        result = self.collection.tags.rename(source, target)
+        duplicate_notes_fixed = 0
+        for note_id in self.collection.find_notes(""):
+            note = self.collection.get_note(note_id)
+            deduped = list(dict.fromkeys(note.tags))
+            if len(deduped) != len(note.tags):
+                note.tags = deduped
+                self.collection.update_note(note)
+                duplicate_notes_fixed += 1
+        return {
+            "source": source,
+            "target": target,
+            "updated_notes": int(result.count),
+            "duplicate_notes_fixed": duplicate_notes_fixed,
+            "deleted": True,
         }
 
     def list_note_types(self, offset: int, limit: int) -> dict[str, Any]:
@@ -4087,14 +4174,26 @@ class AnkiCollectionService:
     async def delete_notes(self, note_ids: list[int]) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.delete_notes(note_ids))
 
-    async def list_tags(self, offset: int, limit: int) -> dict[str, Any]:
-        return await self.executor.run(lambda adapter: adapter.list_tags(offset, limit))
+    async def list_tags(
+        self, offset: int, limit: int, include_counts: bool = False
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.list_tags(offset, limit, include_counts)
+        )
 
     async def rename_tag(self, old_name: str, new_name: str) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.rename_tag(old_name, new_name))
 
     async def delete_tag(self, name: str) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.delete_tag(name))
+
+    async def preview_tag_merge(self, source: str, target: str) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.preview_tag_merge(source, target)
+        )
+
+    async def merge_tags(self, source: str, target: str) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.merge_tags(source, target))
 
     async def list_note_types(self, offset: int, limit: int) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.list_note_types(offset, limit))

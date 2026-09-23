@@ -239,6 +239,8 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_tags_rename",
         "anki_tags_delete_preview",
         "anki_tags_delete",
+        "anki_tags_merge_preview",
+        "anki_tags_merge",
         "anki_cards_search",
         "anki_cards_get",
         "anki_reviews_list",
@@ -450,6 +452,7 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_cards_delete",
         "anki_notes_delete",
         "anki_tags_delete",
+        "anki_tags_merge",
         "anki_note_types_delete",
         "anki_media_delete",
     ):
@@ -1260,6 +1263,112 @@ def test_critical_resource_crud_tools_work_through_json_rpc(client: TestClient) 
     assert changed["result"]["updated"] is True
     assert card_deleted["result"]["deleted"] is True
     assert deck_deleted["result"]["deleted"] is True
+
+
+def test_tag_merge_guarded_flow(client: TestClient) -> None:
+    headers = {
+        "Authorization": "Bearer correct-token",
+        "Accept": "application/json, text/event-stream",
+    }
+    initialized = client.post(
+        "/mcp",
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "pytest", "version": "1"},
+            },
+        },
+    )
+    headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+    request_id = 2
+
+    def call(name: str, arguments: dict[str, object]) -> dict[str, object]:
+        nonlocal request_id
+        response = client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            },
+        )
+        request_id += 1
+        assert response.status_code == 200
+        result = response.json()["result"]
+        assert result.get("isError") is not True, result
+        parsed = json.loads(result["content"][0]["text"])
+        assert isinstance(parsed, dict)
+        return parsed
+
+    def call_error(name: str, arguments: dict[str, object]) -> dict[str, object]:
+        nonlocal request_id
+        response = client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            },
+        )
+        request_id += 1
+        result = response.json()["result"]
+        assert result["isError"] is True
+        text = result["content"][0]["text"]
+        parsed = json.loads(text[text.index("{") :])
+        assert isinstance(parsed, dict)
+        return parsed
+
+    note_type_id = call("anki_note_types_list", {"limit": 10})["items"][0]["id"]
+    deck_id = call("anki_decks_create", {"name": "Tag Merge"})["result"]["id"]
+    call(
+        "anki_notes_create",
+        {
+            "deck_id": deck_id,
+            "note_type_id": note_type_id,
+            "fields": {"Front": "one", "Back": "1"},
+            "tags": ["src", "src::child"],
+        },
+    )
+    call(
+        "anki_notes_create",
+        {
+            "deck_id": deck_id,
+            "note_type_id": note_type_id,
+            "fields": {"Front": "two", "Back": "2"},
+            "tags": ["src", "dst"],
+        },
+    )
+
+    preview = call("anki_tags_merge_preview", {"source": "src", "target": "dst"})
+    token = preview["confirmation_token"]
+
+    failure = call_error(
+        "anki_tags_merge",
+        {"source": "src", "target": "dst", "confirmation_token": "not-a-token"},
+    )
+    assert failure["code"] == "DESTRUCTIVE_CONFIRMATION_REQUIRED"
+    unchanged = {item["name"] for item in call("anki_tags_list", {"limit": 100})["items"]}
+    assert "src" in unchanged
+
+    receipt = call(
+        "anki_tags_merge",
+        {"source": "src", "target": "dst", "confirmation_token": token},
+    )
+    assert receipt["result"]["deleted"] is True
+    assert "confirmation_token" not in json.dumps(receipt)
+    assert token not in json.dumps(receipt)
+    after = {item["name"] for item in call("anki_tags_list", {"limit": 100})["items"]}
+    assert "src" not in after
+    assert "dst" in after
 
 
 def test_sync_tools_use_server_configuration_without_exposing_credentials(

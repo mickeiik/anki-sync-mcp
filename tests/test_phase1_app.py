@@ -121,6 +121,8 @@ def test_scope_and_safety_flags_control_tool_discovery(phase_settings: Settings)
     assert "anki_cards_delete" not in names
     assert "anki_notes_delete" not in names
     assert "anki_tags_delete" not in names
+    assert "anki_tags_merge_preview" not in names
+    assert "anki_tags_merge" not in names
     assert "anki_note_types_create" not in names
     assert "anki_note_types_update" not in names
     assert "anki_note_types_delete" not in names
@@ -222,6 +224,8 @@ def test_scope_and_safety_flags_control_tool_discovery(phase_settings: Settings)
     assert "anki_cards_delete" in all_names
     assert "anki_notes_delete" in all_names
     assert "anki_tags_delete" in all_names
+    assert "anki_tags_merge_preview" in all_names
+    assert "anki_tags_merge" in all_names
     assert "anki_note_types_create" in all_names
     assert "anki_note_types_update" in all_names
     assert "anki_note_types_delete" in all_names

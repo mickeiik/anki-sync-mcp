@@ -1303,11 +1303,19 @@ def create_app(settings: Settings) -> ASGIApp:
     async def tags_list(
         offset: Offset = 0,
         limit: PageLimit = settings.max_page_size,
+        include_counts: StrictBool = False,
         sync_before: SyncMedia = False,
     ) -> dict[str, Any]:
-        """List collection tags with bounded offset pagination."""
+        """List collection tags with bounded offset pagination.
+
+        With include_counts=true each tag also reports note_count, the number of
+        notes carrying that tag or any descendant (child) tag; enabling it scans
+        the collection and is bounded by MCP_MAX_SEARCH_SCAN.
+        """
         return await execute(
-            service.coordinated_read(lambda adapter: adapter.list_tags(offset, limit), sync_before)
+            service.coordinated_read(
+                lambda adapter: adapter.list_tags(offset, limit, include_counts), sync_before
+            )
         )
 
     @scoped_tool(name="anki_tags_rename", scope="write")
@@ -1356,6 +1364,41 @@ def create_app(settings: Settings) -> ASGIApp:
             request,
             lambda adapter: adapter.preview_tag_delete(name),
             lambda adapter: adapter.delete_tag(name),
+        )
+
+    @scoped_tool(
+        name="anki_tags_merge_preview",
+        scope="destructive",
+        enabled=settings.allow_destructive,
+    )
+    async def tags_merge_preview(source: Tag, target: Tag) -> dict[str, Any]:
+        """Preview a tag merge: notes affected and duplicate tags that will be cleaned up."""
+        request = {"source": source, "target": target}
+        return await preview(
+            "anki_tags_merge", request, lambda adapter: adapter.preview_tag_merge(source, target)
+        )
+
+    @scoped_tool(
+        name="anki_tags_merge",
+        scope="destructive",
+        enabled=settings.allow_destructive,
+    )
+    async def tags_merge(
+        source: Tag,
+        target: Tag,
+        confirmation_token: ConfirmationToken,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Merge a tag and its children into another tag after preview and required backup."""
+        request = {"source": source, "target": target}
+        return await guarded_mutate(
+            "anki_tags_merge",
+            idempotency_key,
+            request,
+            confirmation_token,
+            request,
+            lambda adapter: adapter.preview_tag_merge(source, target),
+            lambda adapter: adapter.merge_tags(source, target),
         )
 
     @scoped_tool(name="anki_cards_search", scope="read")
