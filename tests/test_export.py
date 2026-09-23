@@ -99,6 +99,35 @@ async def test_export_notes_csv_omits_inline_when_over_response_budget(
 
 
 @pytest.mark.anyio
+async def test_export_apkg_inlines_when_requested(
+    export_collection: tuple[str, int, int],
+) -> None:
+    path, deck_a, _ = export_collection
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        plain = await service.export_apkg(deck_a, False, True, False)
+        inlined = await service.export_apkg(deck_a, False, True, False, True)
+
+    assert "content_base64" not in plain
+    assert "inline_omitted" not in inlined
+    assert base64.b64decode(inlined["content_base64"]) == Path(inlined["path"]).read_bytes()
+    with zipfile.ZipFile(Path(inlined["path"])) as archive:
+        assert {"collection.anki2", "collection.anki21b"} & set(archive.namelist())
+
+
+@pytest.mark.anyio
+async def test_export_apkg_omits_inline_when_over_response_budget(
+    export_collection: tuple[str, int, int],
+) -> None:
+    path, deck_a, _ = export_collection
+    async with AnkiCollectionService(path, max_page_size=100, max_response_bytes=16) as service:
+        result = await service.export_apkg(deck_a, False, True, False, True)
+
+    assert "content_base64" not in result
+    assert result["inline_omitted"] is True
+    assert result["inline_reason"] == "inline payload would exceed MCP_MAX_RESPONSE_BYTES"
+
+
+@pytest.mark.anyio
 async def test_export_is_bounded_by_search_scan(
     export_collection: tuple[str, int, int],
 ) -> None:

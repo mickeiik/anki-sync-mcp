@@ -313,11 +313,44 @@ async def test_csv_field_columns_reject_out_of_range_and_duplicates(
             await service.import_csv(
                 "fixture.csv", notetype_id, [1, 5], 1, "\t", True, [], "preserve"
             )
-        # Two fields cannot map to the same non-zero column.
+        # Two fields cannot map to the same column.
         with pytest.raises(ValueError, match="same column"):
             await service.import_csv(
                 "fixture.csv", notetype_id, [1, 1], 1, "\t", True, [], "preserve"
             )
+        # Columns are 1-based: 0 must never be accepted and silently blank a field.
+        with pytest.raises(ValueError, match="outside the 1\\.\\."):
+            await service.import_csv(
+                "fixture.csv", notetype_id, [0, 1], 1, "\t", True, [], "preserve"
+            )
+
+
+def test_app_csv_import_rejects_zero_column(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+
+    settings = _import_settings(target, monkeypatch)
+    with TestClient(create_app(settings)) as client:
+        headers = _initialize(client)
+        rejected = _call(
+            client,
+            headers,
+            2,
+            "anki_import_csv",
+            {
+                "filename": "fixture.csv",
+                "notetype_id": 1,
+                "field_columns": [0, 1],
+                "deck_id": 1,
+                "confirmation_token": "token",
+                "idempotency_key": "zero-column",
+            },
+        )
+    assert rejected.get("isError") is True
+    assert "INVALID_ARGUMENT" in rejected["content"][0]["text"]
 
 
 @pytest.mark.anyio

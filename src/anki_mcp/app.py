@@ -69,7 +69,8 @@ MediaContent = Annotated[StrictStr, Field(min_length=1, max_length=22_369_624)]
 InlineImportContent = Annotated[StrictStr, Field(min_length=1, max_length=22_369_624)]
 StableIds = Annotated[list[StableId], Field(min_length=1, max_length=500)]
 NonNegativeInt = Annotated[StrictInt, Field(ge=0)]
-CsvFieldColumns = Annotated[list[NonNegativeInt], Field(max_length=1000)]
+CsvColumn = Annotated[StrictInt, Field(ge=1)]
+CsvFieldColumns = Annotated[list[CsvColumn], Field(max_length=1000)]
 PositiveInt = Annotated[StrictInt, Field(gt=0)]
 CardFlag = Annotated[StrictInt, Field(ge=0, le=7)]
 DailyLimit = Annotated[StrictInt, Field(ge=0, le=999_999)]
@@ -2077,12 +2078,17 @@ def create_app(settings: Settings) -> ASGIApp:
         include_media: StrictBool = True,
         include_scheduling: StrictBool = True,
         include_deck_configs: StrictBool = False,
+        inline: StrictBool = False,
     ) -> dict[str, Any]:
-        """Export the collection or one deck to a generated .apkg file under <parent>/exports."""
+        """Export the collection or one deck to a generated .apkg file under <parent>/exports.
+
+        With inline=true the package bytes are also returned as content_base64 when they fit
+        within MCP_MAX_RESPONSE_BYTES; otherwise inline_omitted is reported.
+        """
         return await execute(
             service.coordinated_read(
                 lambda adapter: adapter.export_apkg(
-                    deck_id, include_media, include_scheduling, include_deck_configs
+                    deck_id, include_media, include_scheduling, include_deck_configs, inline
                 )
             )
         )

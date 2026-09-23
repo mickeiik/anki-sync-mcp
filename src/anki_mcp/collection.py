@@ -3553,6 +3553,7 @@ class CollectionAdapter:
         include_media: bool,
         include_scheduling: bool,
         include_deck_configs: bool,
+        inline: bool = False,
     ) -> dict[str, Any]:
         """Export the collection (or one deck) to a generated ``.apkg`` file."""
         self._require_within_export_bound(deck_id)
@@ -3575,7 +3576,10 @@ class CollectionAdapter:
         except BaseException:
             temp_path.unlink(missing_ok=True)
             raise
-        return self._export_result(filename, path, {"exported_notes": exported_notes})
+        result = self._export_result(filename, path, {"exported_notes": exported_notes})
+        if inline:
+            self._add_inline_content(result, path)
+        return result
 
     def export_notes_csv(
         self,
@@ -3609,18 +3613,22 @@ class CollectionAdapter:
             raise
         result = self._export_result(filename, path, {"rows": rows})
         if inline:
-            size = int(result["size_bytes"])
-            if 4 * ((size + 2) // 3) + 1024 > self.max_response_bytes:
-                result["inline_omitted"] = True
-                result["inline_reason"] = "inline payload would exceed MCP_MAX_RESPONSE_BYTES"
-            else:
-                encoded = base64.b64encode(path.read_bytes())
-                if len(encoded) + 1024 <= self.max_response_bytes:
-                    result["content_base64"] = encoded.decode("ascii")
-                else:
-                    result["inline_omitted"] = True
-                    result["inline_reason"] = "inline payload would exceed MCP_MAX_RESPONSE_BYTES"
+            self._add_inline_content(result, path)
         return result
+
+    def _add_inline_content(self, result: dict[str, Any], path: Path) -> None:
+        """Attach the exported bytes as base64, or mark the inline payload as omitted."""
+        size = int(result["size_bytes"])
+        encoded = (
+            base64.b64encode(path.read_bytes())
+            if 4 * ((size + 2) // 3) + 1024 <= self.max_response_bytes
+            else None
+        )
+        if encoded is not None and len(encoded) + 1024 <= self.max_response_bytes:
+            result["content_base64"] = encoded.decode("ascii")
+        else:
+            result["inline_omitted"] = True
+            result["inline_reason"] = "inline payload would exceed MCP_MAX_RESPONSE_BYTES"
 
     def _import_path(self, filename: str, *, require_exists: bool) -> Path:
         if (
@@ -3841,13 +3849,12 @@ class CollectionAdapter:
     ) -> None:
         column_count = len(metadata.column_labels)
         for column in field_columns:
-            if column < 0 or column > column_count:
+            if column < 1 or column > column_count:
                 raise ValueError(
-                    f"field_columns entry {column} is outside the {column_count} "
+                    f"field_columns entry {column} is outside the 1..{column_count} "
                     f"columns of {filename}"
                 )
-        nonzero = [column for column in field_columns if column != 0]
-        if len(nonzero) != len(set(nonzero)):
+        if len(field_columns) != len(set(field_columns)):
             raise ValueError("field_columns must not map more than one field to the same column")
 
     def import_csv(
@@ -4367,10 +4374,11 @@ class AnkiCollectionService:
         include_media: bool,
         include_scheduling: bool,
         include_deck_configs: bool,
+        inline: bool = False,
     ) -> dict[str, Any]:
         return await self.executor.run(
             lambda adapter: adapter.export_apkg(
-                deck_id, include_media, include_scheduling, include_deck_configs
+                deck_id, include_media, include_scheduling, include_deck_configs, inline
             )
         )
 
