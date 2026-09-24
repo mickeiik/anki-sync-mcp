@@ -442,27 +442,46 @@ class CollectionAdapter:
         }
         return kind
 
-    def _recheck_sync_requirement(self) -> bool:
-        """Recompute the next-write requirement from LOCAL state without a network call.
+    def _local_sync_requirement(self) -> int | None:
+        """The next-write requirement from this collection's own timestamps, no network.
 
-        ``collection.sync_status`` is local-only: it derives the requirement from this
-        client's collection state and cannot observe server-side divergence. Returns
-        True when the requirement was determined, False when it could not be (the
-        error is recorded, never raised).
+        Mirrors the offline half of Anki's sync status (rslib/src/sync/status.rs). The
+        backend ``sync_status`` call is NOT offline in anki 26.5: when the local
+        timestamps look clean it probes the server, so a recheck or a failure path must
+        compute the requirement here instead. Returns None when it cannot be read.
+        """
+        try:
+            db = self.collection.db
+            if db is None:
+                return None
+            row = db.first("select scm, mod, ls from col")
+            if row is None:
+                return None
+            scm, mod, ls = (int(value or 0) for value in row)
+        except Exception:
+            return None
+        # A never-synced collection (ls == 0) has a positive scm, so the
+        # comparison below reports the full sync requirement the installed Anki
+        # reports for it.
+        if scm > ls:
+            return 2
+        if mod > ls:
+            return 1
+        return 0
+
+    def _recheck_sync_requirement(self) -> bool:
+        """Recompute the next-write requirement from this collection's own timestamps.
+
+        The requirement is derived locally, so the recheck performs no network request
+        and cannot observe server-side divergence. Returns True when the requirement was
+        determined, False when it could not be.
         """
         if self._sync_auth is None:
             return False
-        try:
-            required = self.collection.sync_status(self._sync_auth).required
-            name = SYNC_REQUIRED_NAMES[required]
-        except Exception as exc:
-            if self._record_sync_failure(exc) == "AUTH":
-                self._sync_session_valid = False
-                self._invalidate_sync_auth()
-            else:
-                self._sync_session_valid = None
-                self._save_operational_status()
+        required = self._local_sync_requirement()
+        if required is None:
             return False
+        name = SYNC_REQUIRED_NAMES[required]
         # A local-only recheck cannot validate the hkey, so leave the session
         # validity unchanged rather than reporting a bogus session as valid.
         self._next_sync_required = name
@@ -481,32 +500,17 @@ class CollectionAdapter:
         """Arm the local requirement after a failed sync, with zero network calls.
 
         Mirrors Anki's offline requirement logic (``rslib/src/sync/status.rs``) from this
-        collection's own timestamps. Do NOT replace this with ``collection.sync_status``
-        until Anki exposes an offline-only call: in anki 26.5 ``sync_status`` can issue a
-        server request when the local timestamps look clean, and a failure path must add
-        no network calls. Best-effort: any failure here must not mask the original error.
+        collection's own timestamps. Best-effort: any failure here must not mask the
+        original error.
         """
         if self._sync_auth is None or self._pending_full_sync_confirmed:
             return
+        required = self._local_sync_requirement()
+        if required is None:
+            return
         try:
-            db = self.collection.db
-            if db is None:
-                return
-            scm = int(db.scalar("select scm from col") or 0)
-            mod = int(db.scalar("select mod from col") or 0)
-            ls = int(db.scalar("select ls from col") or 0)
-            # A never-synced collection (ls == 0) has a positive scm, so the
-            # comparison below reports the full sync requirement the installed Anki
-            # reports for it.
-            if scm > ls:
-                self._next_sync_required = SYNC_REQUIRED_NAMES[2]
-                self._pending_full_sync = (2, None)
-            elif mod > ls:
-                self._next_sync_required = SYNC_REQUIRED_NAMES[1]
-                self._pending_full_sync = None
-            else:
-                self._next_sync_required = SYNC_REQUIRED_NAMES[0]
-                self._pending_full_sync = None
+            self._next_sync_required = SYNC_REQUIRED_NAMES[required]
+            self._pending_full_sync = (required, None) if required in {2, 3, 4} else None
             # ``_pending_full_sync_confirmed`` stays untouched: only a live server
             # response confirms a requirement in this process.
             self._save_operational_status()
@@ -515,9 +519,10 @@ class CollectionAdapter:
             return
 
     def status(self, recheck: bool = False) -> dict[str, Any]:
-        """Report local readiness; ``recheck`` recomputes the requirement from LOCAL state.
+        """Report local readiness; ``recheck`` recomputes the requirement locally.
 
-        ``recheck`` performs no network request and cannot see server-side changes. To
+        ``recheck`` derives the next-write requirement from this collection's own
+        timestamps, performs no network request, and cannot see server-side changes. To
         confirm the server will accept a write, call ``sync`` (which performs the
         incremental sync and reports ``required``) or simply attempt the write — the
         pre-sync refuses before committing.
@@ -663,6 +668,9 @@ class CollectionAdapter:
                     else "no_valid_backup_available"
                 )
             ),
+            # True when this call wrote over a same-second path, so the earlier
+            # same-second backup is gone and the file now holds THIS call's backup.
+            "overwritten": bool(native_created and path is not None and path in existing),
         }
 
     def _is_valid_backup(self, path: Path) -> bool:

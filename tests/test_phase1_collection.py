@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -461,9 +463,37 @@ async def test_explicit_backup_is_created_in_persistent_backup_directory(
     assert result["requested"] is True
     assert result["created"] is True
     assert result["reason"] is None
+    assert result["overwritten"] is False
     backup_directory = Path(collection_path).parent / "backups"
     assert backup_directory.is_dir()
     assert any(backup_directory.iterdir())
+
+
+@pytest.mark.anyio
+async def test_same_second_backup_overwrite_is_reported(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        first = await service.create_backup()
+        assert first["created"] is True
+        assert first["overwritten"] is False
+        first_path = Path(first["path"])
+        assert first_path.is_file()
+
+        def rewrite(self: Collection, **kwargs: object) -> bool:
+            # Simulate Anki reusing the same second-resolution filename: the file
+            # now holds THIS call's backup, with a newer mtime.
+            now = time.time()
+            os.utime(first_path, (now + 5, now + 5))
+            return True
+
+        monkeypatch.setattr(Collection, "create_backup", rewrite)
+        second = await service.create_backup()
+
+    assert second["created"] is True
+    assert second["path"] == first["path"]
+    assert second["reason"] is None
+    assert second["overwritten"] is True
 
 
 @pytest.mark.anyio
@@ -659,7 +689,9 @@ async def test_retryable_sync_failure_retains_authentication_across_restart(
         await service.sync_login("user", "password", "https://sync.example.test/")
         with pytest.raises(NetworkError, match="sync failed"):
             await service.sync(sync_media=False)
-        assert (await service.status())["authenticated"] is True
+        status = await service.status()
+        assert status["authenticated"] is True
+        assert status["last_sync_error"]["kind"] == "NETWORK"
 
     async with AnkiCollectionService(collection_path, max_page_size=100) as restarted:
         status = await restarted.status()

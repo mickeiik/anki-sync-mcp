@@ -396,6 +396,7 @@ class BackupReceipt(BaseModel):
     created: bool
     path: str
     reason: str | None = None
+    overwritten: bool = False
 
 
 class FsrsRescheduleApplied(BaseModel):
@@ -660,12 +661,12 @@ def create_app(settings: Settings) -> ASGIApp:
     async def status(recheck: StrictBool = False) -> dict[str, Any]:
         """Return actionable local collection, authentication, sync, and recovery status.
 
-        recheck recomputes the next-write requirement from LOCAL collection state
-        (collection.sync_status) and performs NO network request; it cannot observe
-        server-side changes such as another client or a remote replace. To confirm the
-        server will accept a write, call anki_sync (which performs the incremental sync
-        and reports the ``required`` value) or simply attempt the write — the pre-sync
-        refuses before committing.
+        recheck recomputes the next-write requirement from this collection's own
+        timestamps and performs NO network request; it cannot observe server-side changes
+        such as another client or a remote replace. To confirm the server will accept a
+        write, call anki_sync (which performs the incremental sync and reports the
+        ``required`` value) or simply attempt the write — the pre-sync refuses before
+        committing.
         """
         return await execute(service.status(recheck))
 
@@ -734,7 +735,9 @@ def create_app(settings: Settings) -> ASGIApp:
         ``created=false`` with a non-null ``path`` means that existing backup was reused as a
         valid current pre-operation backup. ``reason`` is null when a backup was created,
         "no_collection_changes_since_last_backup" when an existing backup was reused, and
-        "no_valid_backup_available" when none could be selected.
+        "no_valid_backup_available" when none could be selected. ``overwritten=true`` means
+        this call reused a same-second filename and wrote over the earlier same-second
+        backup, which is now gone.
         """
         return await execute(service.create_backup())
 
