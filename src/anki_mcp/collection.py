@@ -20,6 +20,7 @@ from importlib.metadata import version
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any, TypeVar, cast
+from urllib.parse import urlsplit
 from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
 
@@ -153,6 +154,39 @@ DECK_PRESET_SECTIONS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _same_sync_origin(first: str | None, second: str | None) -> bool:
+    """True when two endpoint URLs identify the same origin (scheme/host/port).
+
+    Paths and query strings are ignored. A missing/empty value, a non-HTTP(S)
+    scheme, or an unparseable URL never matches.
+    """
+    if not first or not second:
+        return False
+    try:
+        first_parts = urlsplit(first)
+        second_parts = urlsplit(second)
+        first_port = first_parts.port
+        second_port = second_parts.port
+    except ValueError:
+        return False
+    if first_parts.scheme not in {"http", "https"} or second_parts.scheme not in {
+        "http",
+        "https",
+    }:
+        return False
+    if not first_parts.hostname or not second_parts.hostname:
+        return False
+    if first_port is None:
+        first_port = 443 if first_parts.scheme == "https" else 80
+    if second_port is None:
+        second_port = 443 if second_parts.scheme == "https" else 80
+    return (first_parts.scheme, first_parts.hostname, first_port) == (
+        second_parts.scheme,
+        second_parts.hostname,
+        second_port,
+    )
+
+
 class SyncLoginRequiredError(RuntimeError):
     """Raised when synchronization is requested before remote login."""
 
@@ -267,26 +301,40 @@ class CollectionAdapter:
         self._last_sync_error = last_sync_error if isinstance(last_sync_error, dict) else None
         last_sync_endpoint = status.get("last_sync_endpoint")
         configured = persisted_auth.get("configured_endpoint") if persisted_auth else None
-        # An empty string is not a known identity; treat it as unknown so a
-        # requirement armed against a real server is never wrongly preserved.
-        if isinstance(last_sync_endpoint, str) and last_sync_endpoint:
-            self._last_sync_endpoint = last_sync_endpoint
-        elif isinstance(configured, str) and configured:
-            # A sidecar written before the identity fields existed has no
-            # last_sync_endpoint; fall back to the configured endpoint so the
-            # identity is not lost (a missing identity would wrongly clear a
-            # requirement armed against a specific server).
-            self._last_sync_endpoint = configured
-        else:
+        # A crash between the auth and status writes can pair an armed requirement
+        # with an auth for a DIFFERENT server. When both identity sources are present
+        # but their origins disagree, the persisted identity is inconsistent: treat it
+        # as unknown so the next login clears the requirement instead of trusting it.
+        if (
+            isinstance(last_sync_endpoint, str)
+            and last_sync_endpoint
+            and isinstance(configured, str)
+            and configured
+            and not _same_sync_origin(last_sync_endpoint, configured)
+        ):
             self._last_sync_endpoint = None
-        last_sync_username = status.get("last_sync_username")
-        stored_username = persisted_auth.get("username") if persisted_auth else None
-        if isinstance(last_sync_username, str) and last_sync_username:
-            self._last_sync_username = last_sync_username
-        elif isinstance(stored_username, str) and stored_username:
-            self._last_sync_username = stored_username
-        else:
             self._last_sync_username = None
+        else:
+            # An empty string is not a known identity; treat it as unknown so a
+            # requirement armed against a real server is never wrongly preserved.
+            if isinstance(last_sync_endpoint, str) and last_sync_endpoint:
+                self._last_sync_endpoint = last_sync_endpoint
+            elif isinstance(configured, str) and configured:
+                # A sidecar written before the identity fields existed has no
+                # last_sync_endpoint; fall back to the configured endpoint so the
+                # identity is not lost (a missing identity would wrongly clear a
+                # requirement armed against a specific server).
+                self._last_sync_endpoint = configured
+            else:
+                self._last_sync_endpoint = None
+            last_sync_username = status.get("last_sync_username")
+            stored_username = persisted_auth.get("username") if persisted_auth else None
+            if isinstance(last_sync_username, str) and last_sync_username:
+                self._last_sync_username = last_sync_username
+            elif isinstance(stored_username, str) and stored_username:
+                self._last_sync_username = stored_username
+            else:
+                self._last_sync_username = None
 
     def close(self) -> None:
         try:
@@ -763,6 +811,8 @@ class CollectionAdapter:
             )
         except Exception as exc:
             if not isinstance(exc, NetworkError):
+                self._sync_session_valid = False
+                self._sync_session_checked_at = None
                 self._invalidate_sync_auth()
             raise
         self._post_restore_upload = False
@@ -3632,12 +3682,18 @@ class CollectionAdapter:
             self._next_sync_required = None
             self._pending_full_sync = None
             self._last_sync_error = None
-            self._sync_session_valid = None
-            self._sync_session_checked_at = None
         # Record which identity we just authenticated to; only a successful login
         # reaches this point, so a failed login never updates it.
         self._last_sync_endpoint = new_endpoint
         self._last_sync_username = username
+        # A real login authenticates against the server, unlike the local-only recheck.
+        self._sync_session_valid = True
+        self._sync_session_checked_at = datetime.now(UTC).isoformat()
+        # Persist the final operational status BEFORE the auth, so a crash or a failed
+        # write between the two can never pair an armed requirement with an auth for a
+        # different identity: either no auth is persisted, or the status identity
+        # matches the persisted auth.
+        self._save_operational_status()
         self._state.save_sync_auth(
             {
                 "hkey": self._sync_auth.hkey,
@@ -3646,10 +3702,6 @@ class CollectionAdapter:
                 "username": username,
             }
         )
-        # A real login authenticates against the server, unlike the local-only recheck.
-        self._sync_session_valid = True
-        self._sync_session_checked_at = datetime.now(UTC).isoformat()
-        self._save_operational_status()
         return {"authenticated": True, "endpoint_kind": "custom" if endpoint else "ankiweb"}
 
     def _wait_for_media_sync(self) -> dict[str, Any]:
@@ -3769,6 +3821,8 @@ class CollectionAdapter:
             )
         except Exception as exc:
             if not isinstance(exc, NetworkError):
+                self._sync_session_valid = False
+                self._sync_session_checked_at = None
                 self._invalidate_sync_auth()
             raise
         self._pending_full_sync = None

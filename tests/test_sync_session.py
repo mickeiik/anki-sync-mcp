@@ -16,7 +16,12 @@ from anki.errors import NetworkError, SyncError, SyncErrorKind
 from anki.sync import SyncAuth, SyncOutput
 from anki.sync_pb2 import SyncStatusResponse
 
-from anki_mcp.collection import SYNC_REQUIRED_NAMES, AnkiCollectionService, FullSyncRequiredError
+from anki_mcp.collection import (
+    SYNC_REQUIRED_NAMES,
+    AnkiCollectionService,
+    FullSyncRequiredError,
+    SyncLoginRequiredError,
+)
 from anki_mcp.state import PersistentState
 
 PASSWORD = "phase1-password"
@@ -910,4 +915,179 @@ async def test_failed_login_leaves_the_session_unverified(
             await service.sync_login("user", "wrong", "https://sync.example.test/")
         status = await service.status()
     assert status["sync_session_valid"] is None
+    assert status["authenticated"] is False
+
+
+@pytest.mark.anyio
+async def test_crash_window_does_not_pair_armed_requirement_with_new_auth(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash (or failed final status write) during a switching login must stay safe.
+
+    With the status persisted BEFORE the auth, a crash leaves either no persisted auth
+    or a status whose identity matches the auth. The old order (auth first) left an
+    armed requirement paired with an auth for the NEW server, so a full upload would
+    run against the wrong remote collection.
+    """
+    _stub_login(monkeypatch)
+    monkeypatch.setattr(
+        Collection,
+        "sync_collection",
+        lambda self, auth, sync_media: SyncOutput(required=2, server_media_usn=1),
+    )
+    # Make the crash window deterministic and network-free: a full sync that slips
+    # past the guard would execute this upload against the wrong identity.
+    monkeypatch.setattr(Collection, "create_backup", lambda self, **kwargs: True)
+
+    def must_not_upload(self: Collection, **kwargs: object) -> None:
+        raise AssertionError("full sync upload executed against the new identity")
+
+    monkeypatch.setattr(Collection, "full_upload_or_download", must_not_upload)
+    endpoint_a = "https://a.example.test/"
+    endpoint_b = "https://b.example.test/"
+
+    calls = {"count": 0}
+    original_save_status = PersistentState.save_status
+
+    def fail_on_final_status_write(self: PersistentState, status: dict[str, object]) -> None:
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise OSError("simulated ENOSPC on the final status write")
+        original_save_status(self, status)
+
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        await service.sync_login("user", "password", endpoint_a)
+        await service.sync(sync_media=False)
+        assert (await service.status())["pending_full_sync"] == "FULL_SYNC"
+
+        # The switching login's final status write fails after the auth write would
+        # have happened in the old ordering.
+        monkeypatch.setattr(PersistentState, "save_status", fail_on_final_status_write)
+        with pytest.raises(OSError, match="ENOSPC"):
+            await service.sync_login("user", "password", endpoint_b)
+
+    async with AnkiCollectionService(collection_path, max_page_size=100) as reopened:
+        status = await reopened.status()
+        assert status["authenticated"] is False
+        # No auth was persisted, so a full upload cannot run against the new identity.
+        with pytest.raises(SyncLoginRequiredError):
+            await reopened.full_sync(upload=True)
+        # A retry to the new identity must not leave the stale requirement armed.
+        await reopened.sync_login("user", "password", endpoint_b)
+        retried = await reopened.status()
+    assert retried["pending_full_sync"] is None
+    assert retried["next_sync_required"] is None
+
+
+@pytest.mark.anyio
+async def test_origin_inconsistent_persisted_identity_is_treated_as_unknown(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_login(monkeypatch)
+    _write_persisted_sync_auth(
+        collection_path,
+        {
+            "hkey": "stale-key",
+            "endpoint": "",
+            "configured_endpoint": "https://b.example.test/",
+        },
+    )
+    _write_persisted_status(
+        collection_path,
+        {
+            "pending_full_sync": {"required": 2},
+            "next_sync_required": "FULL_SYNC",
+            "last_sync_endpoint": "https://a.example.test/",
+        },
+    )
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        # The mismatched identity is inconsistent, so it is treated as unknown.
+        assert await service.executor.run(lambda adapter: adapter._last_sync_endpoint) is None
+        assert (await service.status())["pending_full_sync"] == "FULL_SYNC"
+        await service.sync_login("user", "password", "https://a.example.test/")
+        cleared = await service.status()
+    assert cleared["pending_full_sync"] is None
+    assert cleared["next_sync_required"] is None
+
+
+@pytest.mark.anyio
+async def test_same_origin_path_difference_is_not_treated_as_inconsistent(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_login(monkeypatch)
+    _write_persisted_sync_auth(
+        collection_path,
+        {
+            "hkey": "key",
+            "endpoint": "",
+            "configured_endpoint": "https://a.example.test/sync/",
+            "username": "user",
+        },
+    )
+    _write_persisted_status(
+        collection_path,
+        {
+            "pending_full_sync": {"required": 2},
+            "next_sync_required": "FULL_SYNC",
+            "last_sync_endpoint": "https://a.example.test/",
+            "last_sync_username": "user",
+        },
+    )
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        # Only the path differs, so the identity is preserved and the requirement stays.
+        await service.sync_login("user", "password", "https://a.example.test/sync/")
+        preserved = await service.status()
+    assert preserved["pending_full_sync"] == "FULL_SYNC"
+    assert preserved["next_sync_required"] == "FULL_SYNC"
+
+
+@pytest.mark.anyio
+async def test_failed_non_network_full_sync_leaves_session_invalid_after_restart(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_login(monkeypatch)
+    monkeypatch.setattr(
+        Collection,
+        "sync_collection",
+        lambda self, auth, sync_media: SyncOutput(required=4),
+    )
+    monkeypatch.setattr(Collection, "create_backup", lambda self, **kwargs: True)
+
+    def fail(self: Collection, **kwargs: object) -> None:
+        raise RuntimeError("upstream full sync failure")
+
+    monkeypatch.setattr(Collection, "full_upload_or_download", fail)
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        await service.sync_login("user", "password", "https://sync.example.test/")
+        await service.sync(sync_media=False)
+        assert (await service.status())["pending_full_sync"] == "FULL_UPLOAD"
+        with pytest.raises(RuntimeError, match="upstream"):
+            await service.full_sync(upload=True)
+
+    async with AnkiCollectionService(collection_path, max_page_size=100) as reopened:
+        status = await reopened.status()
+    assert status["sync_session_valid"] is False
+    assert status["authenticated"] is False
+
+
+@pytest.mark.anyio
+async def test_failed_non_network_restore_upload_leaves_session_invalid_after_restart(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_login(monkeypatch)
+
+    def fail(self: Collection, **kwargs: object) -> None:
+        raise RuntimeError("upstream restore upload failure")
+
+    monkeypatch.setattr(Collection, "full_upload_or_download", fail)
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        created = await service.create_backup()
+        filename = Path(str(created["path"])).name
+        await service.sync_login("user", "password", "https://sync.example.test/")
+        with pytest.raises(RuntimeError, match="upstream"):
+            await service.restore_backup(filename, "upload_now")
+
+    async with AnkiCollectionService(collection_path, max_page_size=100) as reopened:
+        status = await reopened.status()
+    assert status["sync_session_valid"] is False
     assert status["authenticated"] is False
