@@ -100,21 +100,31 @@ async def test_merge_tags_dedupes_and_renames_children(tag_collection: str) -> N
 @pytest.mark.anyio
 async def test_tag_delete_and_merge_disclose_child_tags(tag_collection: str) -> None:
     async with AnkiCollectionService(tag_collection, max_page_size=100) as service:
-        delete_preview = await service.executor.run(
-            lambda adapter: adapter.preview_tag_delete("a")
-        )
+        delete_preview = await service.executor.run(lambda adapter: adapter.preview_tag_delete("a"))
         assert delete_preview["tags"] == ["a", "a::b"]
+        assert delete_preview["tags_total"] == 2
+        assert delete_preview["tags_truncated"] is False
 
         deleted = await service.executor.run(lambda adapter: adapter.delete_tag("a"))
         assert deleted["deleted_tags"] == ["a", "a::b"]
+        assert deleted["deleted_tags_total"] == 2
+        assert deleted["deleted_tags_truncated"] is False
 
         merge_preview = await service.preview_tag_merge("source", "target")
         assert merge_preview["source_tags"] == ["source", "source::child", "source::solo"]
         assert merge_preview["target_tags"] == ["target", "target::child"]
+        assert merge_preview["source_tags_total"] == 3
+        assert merge_preview["source_tags_truncated"] is False
+        assert merge_preview["target_tags_total"] == 2
+        assert merge_preview["target_tags_truncated"] is False
 
         merged = await service.merge_tags("source", "target")
         assert merged["removed_tags"] == ["source", "source::child", "source::solo"]
         assert merged["merged_into_tags"] == ["target", "target::child"]
+        assert merged["removed_tags_total"] == 3
+        assert merged["removed_tags_truncated"] is False
+        assert merged["merged_into_tags_total"] == 2
+        assert merged["merged_into_tags_truncated"] is False
 
 
 @pytest.mark.anyio
@@ -150,3 +160,65 @@ async def test_merge_tags_removes_unused_registry_tag(tmp_path: Path) -> None:
         assert "keep" in tags
     finally:
         collection.close()
+
+
+@pytest.mark.anyio
+async def test_preview_tag_delete_counts_notes_carrying_child_tags(tmp_path: Path) -> None:
+    path = str(tmp_path / "collection.anki2")
+    collection = Collection(path)
+    try:
+        model = collection.models.current()
+        deck_id = int(collection.decks.id("Tags"))
+        for tags in (["parent"], ["parent::child"], ["parent::child::grand"]):
+            note = collection.new_note(model)
+            note["Front"] = "front"
+            note["Back"] = "back"
+            note.tags = list(tags)
+            collection.add_note(note, deck_id)
+    finally:
+        collection.close()
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        preview = await service.executor.run(lambda adapter: adapter.preview_tag_delete("parent"))
+        deleted = await service.executor.run(lambda adapter: adapter.delete_tag("parent"))
+
+    assert preview["notes"] == 3
+    assert deleted["updated_notes"] == preview["notes"]
+
+
+@pytest.mark.anyio
+async def test_tag_disclosure_truncates_but_fingerprint_binds_full_list(
+    tag_collection: str,
+) -> None:
+    async with AnkiCollectionService(tag_collection, max_page_size=1) as service:
+        delete_preview = await service.executor.run(lambda adapter: adapter.preview_tag_delete("a"))
+        merge_preview = await service.preview_tag_merge("source", "target")
+
+        def _add_beyond_page_tag(adapter) -> None:
+            collection = adapter.collection
+            for note_id in collection.find_notes(""):
+                note = collection.get_note(note_id)
+                if "a" in note.tags:
+                    note.tags = [*note.tags, "a::c"]
+                    collection.update_note(note)
+                    return
+
+        await service.executor.run(_add_beyond_page_tag)
+        refreshed = await service.executor.run(lambda adapter: adapter.preview_tag_delete("a"))
+
+    assert delete_preview["tags"] == ["a"]
+    assert delete_preview["tags_total"] == 2
+    assert delete_preview["tags_truncated"] is True
+    assert merge_preview["source_tags"] == ["source"]
+    assert merge_preview["source_tags_total"] == 3
+    assert merge_preview["source_tags_truncated"] is True
+    assert merge_preview["target_tags"] == ["target"]
+    assert merge_preview["target_tags_total"] == 2
+    assert merge_preview["target_tags_truncated"] is True
+
+    # The extra child is beyond the disclosed page, yet it changes the full-list fingerprint.
+    assert refreshed["tags"] == ["a"]
+    assert refreshed["tags_total"] == 3
+    assert refreshed["tags_truncated"] is True
+    assert refreshed["notes"] == delete_preview["notes"]
+    assert refreshed["state_fingerprint"] != delete_preview["state_fingerprint"]

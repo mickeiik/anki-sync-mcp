@@ -280,6 +280,40 @@ async def test_preview_handles_non_utf8_trash_filename(tmp_path: Path) -> None:
         )
 
     assert preview["files"] == 1
+    # The raw name carries a surrogate escape; the disclosed name must be UTF-8 safe.
+    assert preview["items"] == [{"filename": "bad\ufffd.bin", "size_bytes": 1}]
+
+
+def test_app_non_utf8_trash_filename_previews_and_empties(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "collection.anki2"
+    collection = Collection(str(path))
+    collection.close()
+    trash = tmp_path / "media.trash"
+    trash.mkdir()
+    (trash / os.fsdecode(b"bad\xff.bin")).write_bytes(b"x")
+
+    with TestClient(create_app(_settings(path, monkeypatch))) as client:
+        headers = _initialize(client)
+        preview = _payload(_call(client, headers, 2, "anki_media_empty_trash_preview", {}))
+        assert preview["impact"]["items"] == [{"filename": "bad\ufffd.bin", "size_bytes": 1}]
+        assert preview["impact"]["files"] == 1
+        token = preview["confirmation_token"]
+
+        applied = _payload(
+            _call(
+                client,
+                headers,
+                3,
+                "anki_media_empty_trash",
+                {"confirmation_token": token, "idempotency_key": "empty-nonutf8"},
+            )
+        )
+
+    assert applied["state"] == "committed"
+    assert applied["result"]["files_removed"] == 1
+    assert not trash.exists() or not any(trash.iterdir())
 
 
 @pytest.mark.anyio

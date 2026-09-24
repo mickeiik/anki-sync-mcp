@@ -64,6 +64,8 @@ async def test_tag_resources_can_be_listed_renamed_and_deleted(resource_collecti
         "updated_notes": 1,
         "deleted": True,
         "deleted_tags": ["new-tag"],
+        "deleted_tags_total": 1,
+        "deleted_tags_truncated": False,
     }
     assert final["items"] == []
 

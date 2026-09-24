@@ -251,6 +251,25 @@ async def test_import_apkg_echoes_condition_string_names(
 
 
 @pytest.mark.anyio
+async def test_import_apkg_rejects_out_of_enum_condition(
+    source_collection: tuple[str, int], tmp_path: Path
+) -> None:
+    source, deck_id = source_collection
+    apkg, _ = await _export_fixtures(source, deck_id)
+
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+    shutil.copy2(apkg["path"], _imports_dir(target) / "fixture.apkg")
+
+    async with AnkiCollectionService(str(target), max_page_size=100) as service:
+        with pytest.raises(ValueError, match="unsupported update_notes condition"):
+            await service.import_apkg("fixture.apkg", True, 999, 2, True, False)
+        with pytest.raises(ValueError, match="unsupported update_notetypes condition"):
+            await service.import_apkg("fixture.apkg", True, 2, 999, True, False)
+
+
+@pytest.mark.anyio
 async def test_csv_round_trip(source_collection: tuple[str, int], tmp_path: Path) -> None:
     source, deck_id = source_collection
     _, csv = await _export_fixtures(source, deck_id)

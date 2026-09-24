@@ -158,6 +158,11 @@ DECK_PRESET_SECTIONS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _utf8_safe_name(name: str) -> str:
+    """Replace surrogate escapes so a filesystem name survives UTF-8 JSON encoding."""
+    return name.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+
+
 def _same_sync_origin(first: str | None, second: str | None) -> bool:
     """True when two endpoint URLs identify the same origin (scheme/host/port).
 
@@ -651,7 +656,7 @@ class CollectionAdapter:
                     stat = path.stat()
                     items.append(
                         {
-                            "filename": path.name,
+                            "filename": _utf8_safe_name(path.name),
                             "size_bytes": stat.st_size,
                             "mtime": stat.st_mtime,
                         }
@@ -2453,7 +2458,7 @@ class CollectionAdapter:
             "name": name,
             "updated_notes": int(result.count),
             "deleted": True,
-            "deleted_tags": deleted_tags,
+            **self._disclose_tags("deleted_tags", deleted_tags),
         }
 
     def preview_tag_delete(self, name: str) -> dict[str, Any]:
@@ -2464,15 +2469,16 @@ class CollectionAdapter:
                 "collection exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
             )
         affected_tags = self._tag_children(name)
+        affected = set(affected_tags)
         note_ids = [
             int(note_id)
             for note_id in self.collection.find_notes("")
-            if name in self.collection.get_note(note_id).tags
+            if affected.intersection(self.collection.get_note(note_id).tags)
         ]
         return {
             "notes": len(note_ids),
             "tag": name,
-            "tags": affected_tags,
+            **self._disclose_tags("tags", affected_tags),
             "state_fingerprint": self._impact_fingerprint(
                 {"note_ids": sorted(note_ids), "tags": affected_tags}
             ),
@@ -2487,6 +2493,14 @@ class CollectionAdapter:
             )
         prefix = name + "::"
         return sorted(tag for tag in all_tags if tag == name or tag.startswith(prefix))
+
+    def _disclose_tags(self, prefix: str, values: list[str]) -> dict[str, Any]:
+        """Disclose at most max_page_size tag names, plus the true total and truncation flag."""
+        return {
+            prefix: values[: self.max_page_size],
+            f"{prefix}_total": len(values),
+            f"{prefix}_truncated": len(values) > self.max_page_size,
+        }
 
     def _validate_tag_merge(self, source: str, target: str) -> None:
         if not source.strip() or not target.strip():
@@ -2529,8 +2543,8 @@ class CollectionAdapter:
             "target": target,
             "notes": len(affected),
             "duplicate_notes": len(duplicate_note_ids),
-            "source_tags": source_tags,
-            "target_tags": target_tags,
+            **self._disclose_tags("source_tags", source_tags),
+            **self._disclose_tags("target_tags", target_tags),
             "state_fingerprint": self._impact_fingerprint(
                 {
                     "affected": sorted(affected),
@@ -2567,8 +2581,8 @@ class CollectionAdapter:
             "updated_notes": int(result.count),
             "duplicate_notes_fixed": duplicate_notes_fixed,
             "deleted": source not in self.collection.tags.all(),
-            "removed_tags": source_tags,
-            "merged_into_tags": target_tags,
+            **self._disclose_tags("removed_tags", source_tags),
+            **self._disclose_tags("merged_into_tags", target_tags),
         }
 
     def list_note_types(self, offset: int, limit: int) -> dict[str, Any]:
@@ -2868,7 +2882,9 @@ class CollectionAdapter:
         items = []
         for path in Path(self.collection.media.dir()).iterdir():
             if path.is_file() and not path.is_symlink():
-                items.append({"filename": path.name, "size_bytes": path.stat().st_size})
+                items.append(
+                    {"filename": _utf8_safe_name(path.name), "size_bytes": path.stat().st_size}
+                )
                 if len(items) > self.max_search_scan:
                     raise ValueError(
                         "collection exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
@@ -3017,7 +3033,8 @@ class CollectionAdapter:
                 ]
             ),
             "items": [
-                {"filename": name, "size_bytes": size} for name, size, _ in page["items"]
+                {"filename": _utf8_safe_name(name), "size_bytes": size}
+                for name, size, _ in page["items"]
             ],
             "offset": page["offset"],
             "limit": page["limit"],
@@ -4116,7 +4133,7 @@ class CollectionAdapter:
                     stat = path.stat()
                     items.append(
                         {
-                            "filename": path.name,
+                            "filename": _utf8_safe_name(path.name),
                             "size_bytes": stat.st_size,
                             "mtime": stat.st_mtime,
                         }
@@ -4170,6 +4187,12 @@ class CollectionAdapter:
         with_deck_configs: bool,
     ) -> dict[str, Any]:
         path = self._import_path(filename, require_exists=True)
+        update_notes_name = UPDATE_CONDITION_NAMES.get(update_notes)
+        if update_notes_name is None:
+            raise ValueError("unsupported update_notes condition")
+        update_notetypes_name = UPDATE_CONDITION_NAMES.get(update_notetypes)
+        if update_notetypes_name is None:
+            raise ValueError("unsupported update_notetypes condition")
         try:
             # Re-validate the archive so a file swapped after preview cannot be imported.
             self.preview_import_apkg_file(filename)
@@ -4197,8 +4220,8 @@ class CollectionAdapter:
             "notes_matched_first_field": len(log.first_field_match),
             "notes_found": int(log.found_notes),
             "merge_notetypes": merge_notetypes,
-            "update_notes": UPDATE_CONDITION_NAMES[update_notes],
-            "update_notetypes": UPDATE_CONDITION_NAMES[update_notetypes],
+            "update_notes": update_notes_name,
+            "update_notetypes": update_notetypes_name,
             "with_scheduling": with_scheduling,
             "with_deck_configs": with_deck_configs,
         }
