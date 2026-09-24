@@ -617,6 +617,15 @@ class CollectionAdapter:
             "requested": True,
             "created": bool(native_created and path is not None),
             "path": str(path) if path is not None else None,
+            "reason": (
+                None
+                if native_created and path is not None
+                else (
+                    "no_collection_changes_since_last_backup"
+                    if path is not None
+                    else "no_valid_backup_available"
+                )
+            ),
         }
 
     def _is_valid_backup(self, path: Path) -> bool:
@@ -3064,26 +3073,91 @@ class CollectionAdapter:
             raise RuntimeError("collection database is not open")
         return int(db.scalar("pragma page_count")) * int(db.scalar("pragma page_size"))
 
-    def _collection_state_preview(self) -> dict[str, Any]:
+    def _registry_tags_matching(self, candidates: set[str]) -> set[str]:
+        """Registry rows that equal a candidate under the tags table's ``unicase`` collation.
+
+        Anki declares that collation on ``tags.tag`` and uses it both when registering tags
+        and when the DB check rebuilds the registry, so it is the tag identity. Matching with
+        Python case folding instead would disagree on multi-character folds (e.g. U+FB03).
+        """
+        db = self.collection.db
+        if db is None:
+            raise RuntimeError("collection database is not open")
+        matched: set[str] = set()
+        ordered = sorted(candidates)
+        for start in range(0, len(ordered), 400):
+            chunk = ordered[start : start + 400]
+            placeholders = ",".join("?" * len(chunk))
+            matched.update(
+                db.list(f"select tag from tags where tag in ({placeholders})", *chunk)
+            )
+        return matched
+
+    def _unused_tags(self) -> list[str]:
+        """Tags in the registry that no note references.
+
+        Anki's check-and-repair rebuilds the tag registry from the notes, so it removes
+        every tag no note references; this helper lists them ahead of that repair.
+        """
+        all_tags = self.collection.tags.all()
+        if (
+            len(all_tags) > self.max_search_scan
+            or int(self.collection.note_count()) > self.max_search_scan
+        ):
+            raise ValueError(
+                "collection exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
+            )
+        db = self.collection.db
+        if db is None:
+            raise RuntimeError("collection database is not open")
+        note_tags: set[str] = set()
+        for tags_str in db.list("select tags from notes"):
+            note_tags.update(self.collection.tags.split(tags_str))
+        used = self._registry_tags_matching(note_tags)
+        return sorted((tag for tag in all_tags if tag not in used), key=str.casefold)
+
+    def _collection_state_preview(
+        self, fingerprint_extra: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         # Counts only: the fingerprint must not change on benign size-only drift (WAL
         # checkpointing, field growth), which would spuriously invalidate a preview token.
         cards = int(self.collection.card_count())
         notes = int(self.collection.note_count())
+        payload: dict[str, Any] = {"cards": cards, "notes": notes}
+        if fingerprint_extra is not None:
+            payload.update(fingerprint_extra)
         return {
             "card_count": cards,
             "note_count": notes,
-            "state_fingerprint": self._impact_fingerprint({"cards": cards, "notes": notes}),
+            "state_fingerprint": self._impact_fingerprint(payload),
         }
 
     def preview_check_database(self) -> dict[str, Any]:
-        """Read-only collection snapshot; Anki's integrity check also repairs, so the
-        problems are reported by the guarded apply rather than here."""
-        return self._collection_state_preview()
+        """Read-only collection snapshot listing the unused tags Anki's repair will remove.
+
+        Anki's check-and-repair rebuilds the tag registry from the notes, so it removes every
+        tag no note references; the problems themselves are reported by the guarded apply. The
+        fingerprint binds the full unused-tag list, so drift in it invalidates the token.
+        """
+        unused = self._unused_tags()
+        return {
+            **self._collection_state_preview({"unused_tags": unused}),
+            **self._disclose_tags("unused_tags", unused),
+        }
 
     def check_database(self) -> dict[str, Any]:
+        """Check and repair the collection, reporting the unused tags Anki removed."""
+        unused_before = self._unused_tags()
         report, ok = self.collection.fix_integrity()
+        surviving = self._registry_tags_matching(set(unused_before))
+        removed = [tag for tag in unused_before if tag not in surviving]
         text, truncated = self._truncate_rendered(report)
-        return {"ok": ok, "report": text, "report_truncated": truncated}
+        return {
+            "ok": ok,
+            "report": text,
+            "report_truncated": truncated,
+            **self._disclose_tags("unused_tags_removed", removed),
+        }
 
     def preview_empty_cards(self) -> dict[str, Any]:
         report = self.collection.get_empty_cards()

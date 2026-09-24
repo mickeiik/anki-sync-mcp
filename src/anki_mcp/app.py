@@ -395,6 +395,7 @@ class FsrsReschedulePreviewResult(BaseModel):
 class BackupReceipt(BaseModel):
     created: bool
     path: str
+    reason: str | None = None
 
 
 class FsrsRescheduleApplied(BaseModel):
@@ -727,7 +728,14 @@ def create_app(settings: Settings) -> ASGIApp:
 
     @scoped_tool(name="anki_backup_create", scope="admin")
     async def backup_create() -> dict[str, Any]:
-        """Create an explicit local collection backup in persistent storage."""
+        """Create an explicit local collection backup in persistent storage.
+
+        Anki skips writing a new backup when the collection is unchanged since the last one.
+        ``created=false`` with a non-null ``path`` means that existing backup was reused as a
+        valid current pre-operation backup. ``reason`` is null when a backup was created,
+        "no_collection_changes_since_last_backup" when an existing backup was reused, and
+        "no_valid_backup_available" when none could be selected.
+        """
         return await execute(service.create_backup())
 
     @scoped_tool(name="anki_backups_list", scope="read")
@@ -2103,7 +2111,9 @@ def create_app(settings: Settings) -> ASGIApp:
         """Preview a read-only collection snapshot (card and note counts).
 
         Anki's database check also repairs, so the integrity problems are not reported here;
-        the apply performs the check-and-repair.
+        the apply performs the check-and-repair. Anki's check rebuilds the tag registry from
+        the notes, so the preview also lists the unused tags (those no note references) that
+        the apply will remove.
         """
         request: dict[str, Any] = {}
         return await preview(
@@ -2121,7 +2131,10 @@ def create_app(settings: Settings) -> ASGIApp:
         confirmation_token: ConfirmationToken,
         idempotency_key: IdempotencyKey | None = None,
     ) -> dict[str, Any]:
-        """Check and repair the collection database under the preview token and pre-op backup."""
+        """Check and repair the collection database under the preview token and pre-op backup.
+
+        The result reports the unused tags Anki's repair removed (those no note references).
+        """
         request: dict[str, Any] = {}
         return await guarded_mutate(
             "anki_maintenance_check_database",

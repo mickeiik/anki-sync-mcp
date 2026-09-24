@@ -237,6 +237,7 @@ def test_schema_apply_accepts_explicit_current_backup(
         failed, backup = call("anki_backup_create", {})
         assert failed is False
         assert backup["created"] is True
+        assert backup["reason"] is None
         assert Path(backup["path"]).is_file()
 
         failed, receipt = call(
@@ -253,6 +254,7 @@ def test_schema_apply_accepts_explicit_current_backup(
         assert receipt["result"]["template_count"] == len(mappings)
         assert receipt["result"]["backup"]["created"] is False
         assert receipt["result"]["backup"]["path"] == backup["path"]
+        assert receipt["result"]["backup"]["reason"] == "no_collection_changes_since_last_backup"
 
 
 def test_schema_apply_reports_backup_gate_failure_and_logs_correlation(

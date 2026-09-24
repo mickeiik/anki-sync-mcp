@@ -36,6 +36,25 @@ def _seed(path: Path, empty: int, valid: int = 0) -> list[int]:
     return empty_note_ids
 
 
+def _seed_tagged_notes(path: Path, tags_by_note: list[list[str]]) -> list[int]:
+    """Create a collection with one note per tag list."""
+    collection = Collection(str(path))
+    note_ids: list[int] = []
+    try:
+        model = collection.models.current()
+        deck = int(collection.decks.id("Maintenance"))
+        for index, tags in enumerate(tags_by_note):
+            note = collection.new_note(model)
+            note["Front"] = f"tagged-front-{index}"
+            note["Back"] = f"tagged-back-{index}"
+            note.tags = tags
+            collection.add_note(note, deck)
+            note_ids.append(int(note.id))
+    finally:
+        collection.close()
+    return note_ids
+
+
 def _settings(path: Path, monkeypatch: pytest.MonkeyPatch) -> Settings:
     monkeypatch.setenv("MCP_AUTH_TOKEN", "maintenance-token")
     monkeypatch.setenv("ANKI_COLLECTION_PATH", str(path))
@@ -122,12 +141,95 @@ async def test_preview_check_database_is_read_only(
         assert preview["card_count"] == 1
         assert preview["note_count"] == 1
         assert isinstance(preview["state_fingerprint"], str)
+        # The seeded note carries no tags, so nothing is unused.
+        assert preview["unused_tags"] == []
+        assert preview["unused_tags_total"] == 0
+        assert preview["unused_tags_truncated"] is False
         applied = await service.executor.run(lambda adapter: adapter.check_database())
         assert calls == ["fix_integrity"]
 
     assert applied["ok"] is False
     assert applied["report"] == "recorded integrity report"
     assert applied["report_truncated"] is False
+
+
+@pytest.mark.anyio
+async def test_check_database_discloses_and_removes_unused_tags(tmp_path: Path) -> None:
+    path = tmp_path / "collection.anki2"
+    note_ids = _seed_tagged_notes(path, [["keep", "zombie"], ["keep"]])
+
+    async with AnkiCollectionService(str(path), max_page_size=100) as service:
+        # Drop the note carrying "zombie" so the tag stays in the registry unused.
+        await service.executor.run(
+            lambda adapter: adapter.collection.remove_notes([note_ids[0]])
+        )
+        preview = await service.executor.run(lambda adapter: adapter.preview_check_database())
+        assert preview["unused_tags"] == ["zombie"]
+        assert preview["unused_tags_total"] == 1
+        assert preview["unused_tags_truncated"] is False
+
+        applied = await service.executor.run(lambda adapter: adapter.check_database())
+        assert applied["unused_tags_removed"] == ["zombie"]
+        assert applied["unused_tags_removed_total"] == 1
+        assert applied["unused_tags_removed_truncated"] is False
+
+        registry = await service.executor.run(lambda adapter: adapter.collection.tags.all())
+        assert "zombie" not in registry
+        assert "keep" in registry
+
+        second_preview = await service.executor.run(
+            lambda adapter: adapter.preview_check_database()
+        )
+        second_applied = await service.executor.run(lambda adapter: adapter.check_database())
+
+    assert second_preview["unused_tags"] == []
+    assert second_applied["unused_tags_removed_total"] == 0
+
+
+@pytest.mark.anyio
+async def test_check_database_discloses_ligature_tags_anki_folds(tmp_path: Path) -> None:
+    # Anki's tags table uses a `unicase` collation that does not equate every ligature with
+    # its expansion: a note tagged "ffi" does not keep an unused "ﬃ" (U+FB03) row alive.
+    # The disclosure must use that collation, not Python case folding.
+    path = tmp_path / "collection.anki2"
+    note_ids = _seed_tagged_notes(path, [["ffi"], ["\ufb03"]])
+
+    async with AnkiCollectionService(str(path), max_page_size=100) as service:
+        await service.executor.run(
+            lambda adapter: adapter.collection.remove_notes([note_ids[1]])
+        )
+        preview = await service.executor.run(lambda adapter: adapter.preview_check_database())
+        applied = await service.executor.run(lambda adapter: adapter.check_database())
+
+    assert preview["unused_tags"] == ["\ufb03"]
+    assert applied["unused_tags_removed"] == ["\ufb03"]
+
+
+@pytest.mark.anyio
+async def test_check_database_fingerprint_tracks_unused_tags(tmp_path: Path) -> None:
+    path = tmp_path / "collection.anki2"
+    note_ids = _seed_tagged_notes(path, [["zombie"], ["keep"]])
+
+    async with AnkiCollectionService(str(path), max_page_size=100) as service:
+        first = await service.executor.run(lambda adapter: adapter.preview_check_database())
+        assert first["unused_tags"] == []
+
+        def orphan_tag(adapter: CollectionAdapter) -> None:
+            note = adapter.collection.get_note(note_ids[0])
+            note.tags = ["keep"]
+            adapter.collection.update_note(note)
+
+        # Dropping "zombie" from its note leaves it in the registry unused, without
+        # changing the card or note counts.
+        await service.executor.run(orphan_tag)
+        second = await service.executor.run(lambda adapter: adapter.preview_check_database())
+
+    assert (first["card_count"], first["note_count"]) == (
+        second["card_count"],
+        second["note_count"],
+    )
+    assert second["unused_tags"] == ["zombie"]
+    assert first["state_fingerprint"] != second["state_fingerprint"]
 
 
 @pytest.mark.anyio
@@ -284,6 +386,53 @@ def test_app_empty_cards_rejects_stale_token(
     assert remaining["impact"]["notes"] == 1
 
 
+def test_app_check_database_rejects_stale_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "collection.anki2"
+    note_ids = _seed_tagged_notes(path, [["zombie"]])
+
+    with TestClient(create_app(_settings(path, monkeypatch))) as client:
+        headers = _initialize(client)
+        preview = _payload(
+            _call(client, headers, 2, "anki_maintenance_check_database_preview", {})
+        )
+        assert preview["impact"]["unused_tags"] == []
+        token = preview["confirmation_token"]
+
+        # Removing the tag from its only note leaves "zombie" in the registry unused. The card
+        # and note counts are unchanged, so only the unused-tag set can invalidate the token.
+        _call(
+            client,
+            headers,
+            3,
+            "anki_notes_remove_tags",
+            {
+                "note_ids": [note_ids[0]],
+                "tags": ["zombie"],
+                "idempotency_key": "maintenance-check-stale-tags",
+            },
+        )
+
+        stale = _call(
+            client,
+            headers,
+            4,
+            "anki_maintenance_check_database",
+            {"confirmation_token": token, "idempotency_key": "maintenance-check-stale"},
+        )
+        assert stale.get("isError") is True
+        assert "DESTRUCTIVE_CONFIRMATION_REQUIRED" in stale["content"][0]["text"]
+
+        refreshed = _payload(
+            _call(client, headers, 5, "anki_maintenance_check_database_preview", {})
+        )
+
+    assert refreshed["impact"]["card_count"] == preview["impact"]["card_count"]
+    assert refreshed["impact"]["note_count"] == preview["impact"]["note_count"]
+    assert refreshed["impact"]["unused_tags"] == ["zombie"]
+
+
 @pytest.mark.anyio
 async def test_empty_cards_scan_bound_is_enforced(tmp_path: Path) -> None:
     path = tmp_path / "collection.anki2"
@@ -333,6 +482,9 @@ def test_app_check_database_guarded_flow(
             _call(client, headers, 2, "anki_maintenance_check_database_preview", {})
         )
         assert preview["impact"]["card_count"] == 1
+        assert preview["impact"]["unused_tags"] == []
+        assert preview["impact"]["unused_tags_total"] == 0
+        assert preview["impact"]["unused_tags_truncated"] is False
         token = preview["confirmation_token"]
 
         garbage = _call(
@@ -357,6 +509,9 @@ def test_app_check_database_guarded_flow(
 
     assert applied["state"] == "committed"
     assert applied["result"]["report"]
+    assert applied["result"]["unused_tags_removed"] == []
+    assert applied["result"]["unused_tags_removed_total"] == 0
+    assert applied["result"]["unused_tags_removed_truncated"] is False
     assert Path(applied["result"]["backup"]["path"]).is_file()
     assert token not in json.dumps(applied)
 

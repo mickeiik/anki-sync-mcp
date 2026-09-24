@@ -459,9 +459,28 @@ async def test_explicit_backup_is_created_in_persistent_backup_directory(
     async with AnkiCollectionService(collection_path, max_page_size=100) as service:
         result = await service.create_backup()
     assert result["requested"] is True
+    assert result["created"] is True
+    assert result["reason"] is None
     backup_directory = Path(collection_path).parent / "backups"
     assert backup_directory.is_dir()
     assert any(backup_directory.iterdir())
+
+
+@pytest.mark.anyio
+async def test_explicit_backup_reports_when_none_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = str(tmp_path / "fresh.anki2")
+    Collection(path).close()
+    monkeypatch.setattr(Collection, "create_backup", lambda *args, **kwargs: False)
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        result = await service.create_backup()
+
+    assert result["requested"] is True
+    assert result["created"] is False
+    assert result["path"] is None
+    assert result["reason"] == "no_valid_backup_available"
 
 
 @pytest.mark.anyio
