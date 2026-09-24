@@ -158,9 +158,14 @@ DECK_PRESET_SECTIONS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _utf8_safe_name(name: str) -> str:
-    """Replace surrogate escapes so a filesystem name survives UTF-8 JSON encoding."""
-    return name.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+def _filename_fields(name: str) -> dict[str, Any]:
+    """A UTF-8-safe ``filename``, flagged when a non-UTF-8 name had to be altered."""
+    safe = name.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+    fields: dict[str, Any] = {"filename": safe}
+    if safe != name:
+        # The display name is lossy and cannot be used as a handle; say so.
+        fields["filename_sanitized"] = True
+    return fields
 
 
 def _same_sync_origin(first: str | None, second: str | None) -> bool:
@@ -656,7 +661,7 @@ class CollectionAdapter:
                     stat = path.stat()
                     items.append(
                         {
-                            "filename": _utf8_safe_name(path.name),
+                            **_filename_fields(path.name),
                             "size_bytes": stat.st_size,
                             "mtime": stat.st_mtime,
                         }
@@ -2469,11 +2474,15 @@ class CollectionAdapter:
                 "collection exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
             )
         affected_tags = self._tag_children(name)
-        affected = set(affected_tags)
+        # Anki matches tags case-insensitively (tags.remove does too), so compare
+        # casefolded to keep the preview count in step with the apply result.
+        affected = {tag.casefold() for tag in affected_tags}
         note_ids = [
             int(note_id)
             for note_id in self.collection.find_notes("")
-            if affected.intersection(self.collection.get_note(note_id).tags)
+            if affected.intersection(
+                tag.casefold() for tag in self.collection.get_note(note_id).tags
+            )
         ]
         return {
             "notes": len(note_ids),
@@ -2883,7 +2892,7 @@ class CollectionAdapter:
         for path in Path(self.collection.media.dir()).iterdir():
             if path.is_file() and not path.is_symlink():
                 items.append(
-                    {"filename": _utf8_safe_name(path.name), "size_bytes": path.stat().st_size}
+                    {**_filename_fields(path.name), "size_bytes": path.stat().st_size}
                 )
                 if len(items) > self.max_search_scan:
                     raise ValueError(
@@ -3033,7 +3042,7 @@ class CollectionAdapter:
                 ]
             ),
             "items": [
-                {"filename": _utf8_safe_name(name), "size_bytes": size}
+                {**_filename_fields(name), "size_bytes": size}
                 for name, size, _ in page["items"]
             ],
             "offset": page["offset"],
@@ -4133,7 +4142,7 @@ class CollectionAdapter:
                     stat = path.stat()
                     items.append(
                         {
-                            "filename": _utf8_safe_name(path.name),
+                            **_filename_fields(path.name),
                             "size_bytes": stat.st_size,
                             "mtime": stat.st_mtime,
                         }

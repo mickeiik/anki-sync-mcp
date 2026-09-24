@@ -222,3 +222,45 @@ async def test_tag_disclosure_truncates_but_fingerprint_binds_full_list(
     assert refreshed["tags_truncated"] is True
     assert refreshed["notes"] == delete_preview["notes"]
     assert refreshed["state_fingerprint"] != delete_preview["state_fingerprint"]
+
+
+@pytest.mark.anyio
+async def test_tag_delete_preview_matches_apply_for_case_variant_tags(tmp_path: Path) -> None:
+    """A hand-edited DB can hold a case variant; the preview must match the apply.
+
+    Anki matches tags case-insensitively (``tags.remove`` does too), so the preview
+    count must use the same comparison.
+    """
+    path = str(tmp_path / "collection.anki2")
+    collection = Collection(path)
+    try:
+        model = collection.models.current()
+        deck_id = int(collection.decks.id("Tags"))
+        note_ids: list[int] = []
+        for _ in range(2):
+            note = collection.new_note(model)
+            note["Front"] = "front"
+            note["Back"] = "back"
+            note.tags = ["parent"]
+            collection.add_note(note, deck_id)
+            note_ids.append(int(note.id))
+    finally:
+        collection.close()
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+
+        def make_case_variant(adapter: object) -> None:
+            collection = adapter.collection  # type: ignore[attr-defined]
+            # Force a case variant directly in the DB (safely integer/value literal).
+            collection.db.execute(
+                f"update notes set tags = ' Parent ' where id = {note_ids[1]}"
+            )
+
+        await service.executor.run(make_case_variant)
+        preview = await service.executor.run(
+            lambda adapter: adapter.preview_tag_delete("parent")
+        )
+        applied = await service.executor.run(lambda adapter: adapter.delete_tag("parent"))
+
+    assert preview["notes"] == applied["updated_notes"]
+    assert preview["notes"] >= 2

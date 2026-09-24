@@ -280,8 +280,11 @@ async def test_preview_handles_non_utf8_trash_filename(tmp_path: Path) -> None:
         )
 
     assert preview["files"] == 1
-    # The raw name carries a surrogate escape; the disclosed name must be UTF-8 safe.
-    assert preview["items"] == [{"filename": "bad\ufffd.bin", "size_bytes": 1}]
+    # The raw name carries a surrogate escape; the disclosed name must be UTF-8 safe
+    # and flagged as sanitized (the display name is not a usable handle).
+    assert preview["items"] == [
+        {"filename": "bad\ufffd.bin", "size_bytes": 1, "filename_sanitized": True}
+    ]
 
 
 def test_app_non_utf8_trash_filename_previews_and_empties(
@@ -297,7 +300,9 @@ def test_app_non_utf8_trash_filename_previews_and_empties(
     with TestClient(create_app(_settings(path, monkeypatch))) as client:
         headers = _initialize(client)
         preview = _payload(_call(client, headers, 2, "anki_media_empty_trash_preview", {}))
-        assert preview["impact"]["items"] == [{"filename": "bad\ufffd.bin", "size_bytes": 1}]
+        assert preview["impact"]["items"] == [
+            {"filename": "bad\ufffd.bin", "size_bytes": 1, "filename_sanitized": True}
+        ]
         assert preview["impact"]["files"] == 1
         token = preview["confirmation_token"]
 
