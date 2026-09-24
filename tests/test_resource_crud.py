@@ -59,7 +59,12 @@ async def test_tag_resources_can_be_listed_renamed_and_deleted(resource_collecti
     assert listed["items"] == [{"name": "old-tag", "name_truncated": False}]
     assert renamed == {"old_name": "old-tag", "new_name": "new-tag", "updated_notes": 1}
     assert renamed_notes["total"] == 1
-    assert deleted == {"name": "new-tag", "updated_notes": 1, "deleted": True}
+    assert deleted == {
+        "name": "new-tag",
+        "updated_notes": 1,
+        "deleted": True,
+        "deleted_tags": ["new-tag"],
+    }
     assert final["items"] == []
 
 

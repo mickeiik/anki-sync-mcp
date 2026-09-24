@@ -16,7 +16,12 @@ from anki.collection import Collection
 from starlette.testclient import TestClient
 
 from anki_mcp.app import create_app
-from anki_mcp.collection import AnkiCollectionService, ImportFileError, ResourceLimitError
+from anki_mcp.collection import (
+    UPDATE_CONDITIONS,
+    AnkiCollectionService,
+    ImportFileError,
+    ResourceLimitError,
+)
 from anki_mcp.config import Settings
 
 
@@ -213,8 +218,36 @@ async def test_apkg_round_trip(source_collection: tuple[str, int], tmp_path: Pat
 
     assert result["notes_added"] == 2
     assert result["notes_found"] == 2
+    assert result["update_notes"] == "NEVER"
+    assert result["update_notetypes"] == "NEVER"
     assert {note["first_field"] for note in searched["items"]} == {"front-a1", "front-a2"}
     assert field_tuples == {("front-a1", "back-a1"), ("front-a2", "back-a2")}
+
+
+@pytest.mark.anyio
+async def test_import_apkg_echoes_condition_string_names(
+    source_collection: tuple[str, int], tmp_path: Path
+) -> None:
+    source, deck_id = source_collection
+    apkg, _ = await _export_fixtures(source, deck_id)
+
+    target = tmp_path / "target" / "collection.anki2"
+    target.parent.mkdir(parents=True)
+    _empty_collection(target)
+    shutil.copy2(apkg["path"], _imports_dir(target) / "fixture.apkg")
+
+    async with AnkiCollectionService(str(target), max_page_size=100) as service:
+        result = await service.import_apkg(
+            "fixture.apkg",
+            False,
+            UPDATE_CONDITIONS["ALWAYS"],
+            UPDATE_CONDITIONS["IF_NEWER"],
+            True,
+            False,
+        )
+
+    assert result["update_notes"] == "ALWAYS"
+    assert result["update_notetypes"] == "IF_NEWER"
 
 
 @pytest.mark.anyio

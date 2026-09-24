@@ -98,6 +98,26 @@ async def test_merge_tags_dedupes_and_renames_children(tag_collection: str) -> N
 
 
 @pytest.mark.anyio
+async def test_tag_delete_and_merge_disclose_child_tags(tag_collection: str) -> None:
+    async with AnkiCollectionService(tag_collection, max_page_size=100) as service:
+        delete_preview = await service.executor.run(
+            lambda adapter: adapter.preview_tag_delete("a")
+        )
+        assert delete_preview["tags"] == ["a", "a::b"]
+
+        deleted = await service.executor.run(lambda adapter: adapter.delete_tag("a"))
+        assert deleted["deleted_tags"] == ["a", "a::b"]
+
+        merge_preview = await service.preview_tag_merge("source", "target")
+        assert merge_preview["source_tags"] == ["source", "source::child", "source::solo"]
+        assert merge_preview["target_tags"] == ["target", "target::child"]
+
+        merged = await service.merge_tags("source", "target")
+        assert merged["removed_tags"] == ["source", "source::child", "source::solo"]
+        assert merged["merged_into_tags"] == ["target", "target::child"]
+
+
+@pytest.mark.anyio
 async def test_merge_tags_removes_unused_registry_tag(tmp_path: Path) -> None:
     path = str(tmp_path / "collection.anki2")
     collection = Collection(path)

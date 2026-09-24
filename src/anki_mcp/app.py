@@ -1350,7 +1350,7 @@ def create_app(settings: Settings) -> ASGIApp:
         enabled=settings.allow_destructive,
     )
     async def tags_delete_preview(name: Tag) -> dict[str, Any]:
-        """Preview how many notes will lose a collection tag."""
+        """Preview the notes and child tags (``name::*``) that will lose this tag."""
         request = {"name": name}
         return await preview(
             "anki_tags_delete", request, lambda adapter: adapter.preview_tag_delete(name)
@@ -1384,7 +1384,7 @@ def create_app(settings: Settings) -> ASGIApp:
         enabled=settings.allow_destructive,
     )
     async def tags_merge_preview(source: Tag, target: Tag) -> dict[str, Any]:
-        """Preview a tag merge: notes affected and duplicate tags that will be cleaned up."""
+        """Preview a tag merge: notes affected and the source/target tag trees involved."""
         request = {"source": source, "target": target}
         return await preview(
             "anki_tags_merge", request, lambda adapter: adapter.preview_tag_merge(source, target)
@@ -2049,11 +2049,20 @@ def create_app(settings: Settings) -> ASGIApp:
         scope="destructive",
         enabled=settings.allow_destructive,
     )
-    async def media_empty_trash_preview() -> dict[str, Any]:
-        """Preview the trashed media files that will be permanently deleted."""
-        request: dict[str, Any] = {}
+    async def media_empty_trash_preview(
+        offset: Offset = 0, limit: PageLimit = settings.max_page_size
+    ) -> dict[str, Any]:
+        """Preview the trashed media files that will be permanently deleted.
+
+        ``items`` lists the trashed files (filename, size_bytes) for the given
+        offset/limit page; ``state_fingerprint`` covers the entire trash, so it is
+        unchanged by the paging arguments and always binds the full contents.
+        """
+        request: dict[str, Any] = {"offset": offset, "limit": limit}
         return await preview(
-            "anki_media_empty_trash", request, lambda adapter: adapter.preview_media_empty_trash()
+            "anki_media_empty_trash",
+            request,
+            lambda adapter: adapter.preview_media_empty_trash(offset, limit),
         )
 
     @scoped_tool(
@@ -2063,21 +2072,24 @@ def create_app(settings: Settings) -> ASGIApp:
     )
     async def media_empty_trash(
         confirmation_token: ConfirmationToken,
+        offset: Offset = 0,
+        limit: PageLimit = settings.max_page_size,
         idempotency_key: IdempotencyKey | None = None,
     ) -> dict[str, Any]:
         """Permanently delete trashed media after a matching impact preview and required backup.
 
+        Use the same offset/limit as the preview so the re-computed impact matches.
         The verified backup contains the collection database only, so emptied media cannot be
         restored.
         """
-        request: dict[str, Any] = {}
+        request: dict[str, Any] = {"offset": offset, "limit": limit}
         return await guarded_mutate(
             "anki_media_empty_trash",
             idempotency_key,
             request,
             confirmation_token,
             request,
-            lambda adapter: adapter.preview_media_empty_trash(),
+            lambda adapter: adapter.preview_media_empty_trash(offset, limit),
             lambda adapter: adapter.empty_media_trash(),
             sync_media=True,
         )

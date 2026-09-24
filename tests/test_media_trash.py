@@ -283,6 +283,77 @@ async def test_preview_handles_non_utf8_trash_filename(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_preview_lists_trashed_items_and_paginates(tmp_path: Path) -> None:
+    path = tmp_path / "collection.anki2"
+    _trashed_collection(path, {"a.txt": b"aaaa", "b.txt": b"bb", "c.txt": b"ccc"})
+
+    async with AnkiCollectionService(str(path), max_page_size=100) as service:
+        full = await service.executor.run(lambda adapter: adapter.preview_media_empty_trash())
+        page = await service.executor.run(
+            lambda adapter: adapter.preview_media_empty_trash(offset=1, limit=1)
+        )
+
+    assert full["items"] == [
+        {"filename": "a.txt", "size_bytes": 4},
+        {"filename": "b.txt", "size_bytes": 2},
+        {"filename": "c.txt", "size_bytes": 3},
+    ]
+    assert full["total"] == 3
+    assert full["offset"] == 0
+    assert full["limit"] == 100
+    assert full["has_more"] is False
+
+    assert page["items"] == [{"filename": "b.txt", "size_bytes": 2}]
+    assert page["total"] == 3
+    assert page["offset"] == 1
+    assert page["limit"] == 1
+    assert page["has_more"] is True
+    # Paging must not change the fingerprint, which binds the FULL trash contents.
+    assert page["state_fingerprint"] == full["state_fingerprint"]
+
+
+def test_app_empty_trash_guarded_flow_with_paging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "collection.anki2"
+    _trashed_collection(path, {"a.txt": b"aaaa", "b.txt": b"bb"})
+    trash = _trash_folder(path)
+
+    with TestClient(create_app(_settings(path, monkeypatch))) as client:
+        headers = _initialize(client)
+        preview = _payload(
+            _call(
+                client,
+                headers,
+                2,
+                "anki_media_empty_trash_preview",
+                {"offset": 1, "limit": 1},
+            )
+        )
+        assert preview["impact"]["items"] == [{"filename": "b.txt", "size_bytes": 2}]
+        token = preview["confirmation_token"]
+
+        applied = _payload(
+            _call(
+                client,
+                headers,
+                3,
+                "anki_media_empty_trash",
+                {
+                    "confirmation_token": token,
+                    "offset": 1,
+                    "limit": 1,
+                    "idempotency_key": "empty-trash-paged",
+                },
+            )
+        )
+
+    assert applied["state"] == "committed"
+    assert applied["result"]["files_removed"] == 2
+    assert not trash.exists() or not any(trash.iterdir())
+
+
+@pytest.mark.anyio
 async def test_symlink_entry_is_emptied_without_following_the_target(tmp_path: Path) -> None:
     path = tmp_path / "collection.anki2"
     collection = Collection(str(path))

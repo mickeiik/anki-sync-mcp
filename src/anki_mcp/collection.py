@@ -100,6 +100,10 @@ UPDATE_CONDITIONS: dict[str, ImportAnkiPackageUpdateCondition.ValueType] = {
         "IMPORT_ANKI_PACKAGE_UPDATE_CONDITION_NEVER"
     ),
 }
+# Echo the request contract strings (not protobuf names or integers) in import results.
+UPDATE_CONDITION_NAMES: dict[int, str] = {
+    value: name for name, value in UPDATE_CONDITIONS.items()
+}
 UNDO_HISTORY_NOTE = (
     "Undo/redo history is held in memory for the running collection process; it is cleared by "
     "successful synchronization and is not durable across restarts or full downloads."
@@ -2443,8 +2447,14 @@ class CollectionAdapter:
             raise ValueError(
                 "collection exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
             )
+        deleted_tags = self._tag_children(name)
         result = self.collection.tags.remove(name)
-        return {"name": name, "updated_notes": int(result.count), "deleted": True}
+        return {
+            "name": name,
+            "updated_notes": int(result.count),
+            "deleted": True,
+            "deleted_tags": deleted_tags,
+        }
 
     def preview_tag_delete(self, name: str) -> dict[str, Any]:
         if name not in self.collection.tags.all():
@@ -2453,6 +2463,7 @@ class CollectionAdapter:
             raise ValueError(
                 "collection exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
             )
+        affected_tags = self._tag_children(name)
         note_ids = [
             int(note_id)
             for note_id in self.collection.find_notes("")
@@ -2461,8 +2472,21 @@ class CollectionAdapter:
         return {
             "notes": len(note_ids),
             "tag": name,
-            "state_fingerprint": self._impact_fingerprint(sorted(note_ids)),
+            "tags": affected_tags,
+            "state_fingerprint": self._impact_fingerprint(
+                {"note_ids": sorted(note_ids), "tags": affected_tags}
+            ),
         }
+
+    def _tag_children(self, name: str) -> list[str]:
+        """The tag and all ``name::*`` descendants, bounded by MCP_MAX_SEARCH_SCAN."""
+        all_tags = self.collection.tags.all()
+        if len(all_tags) > self.max_search_scan:
+            raise ValueError(
+                "collection exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
+            )
+        prefix = name + "::"
+        return sorted(tag for tag in all_tags if tag == name or tag.startswith(prefix))
 
     def _validate_tag_merge(self, source: str, target: str) -> None:
         if not source.strip() or not target.strip():
@@ -2498,12 +2522,22 @@ class CollectionAdapter:
                 "collection exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
             )
         affected, duplicate_note_ids = self._scan_tag_merge(source, target)
+        source_tags = self._tag_children(source)
+        target_tags = self._tag_children(target)
         return {
             "source": source,
             "target": target,
             "notes": len(affected),
             "duplicate_notes": len(duplicate_note_ids),
-            "state_fingerprint": self._impact_fingerprint(sorted(affected)),
+            "source_tags": source_tags,
+            "target_tags": target_tags,
+            "state_fingerprint": self._impact_fingerprint(
+                {
+                    "affected": sorted(affected),
+                    "source_tags": source_tags,
+                    "target_tags": target_tags,
+                }
+            ),
         }
 
     def merge_tags(self, source: str, target: str) -> dict[str, Any]:
@@ -2512,6 +2546,8 @@ class CollectionAdapter:
             raise ValueError(
                 "collection exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
             )
+        source_tags = self._tag_children(source)
+        target_tags = self._tag_children(target)
         affected, _ = self._scan_tag_merge(source, target)
         result = self.collection.tags.rename(source, target)
         duplicate_notes_fixed = 0
@@ -2531,6 +2567,8 @@ class CollectionAdapter:
             "updated_notes": int(result.count),
             "duplicate_notes_fixed": duplicate_notes_fixed,
             "deleted": source not in self.collection.tags.all(),
+            "removed_tags": source_tags,
+            "merged_into_tags": target_tags,
         }
 
     def list_note_types(self, offset: int, limit: int) -> dict[str, Any]:
@@ -2964,8 +3002,11 @@ class CollectionAdapter:
                 raise ValueError(f"media trash could not be read: {exc}") from exc
         return entries
 
-    def preview_media_empty_trash(self) -> dict[str, Any]:
+    def preview_media_empty_trash(
+        self, offset: int = 0, limit: int | None = None
+    ) -> dict[str, Any]:
         entries = sorted(self._media_trash_entries())
+        page = self._page(entries, offset, self.max_page_size if limit is None else limit)
         return {
             "files": len(entries),
             "bytes": sum(size for _, size, _ in entries),
@@ -2975,6 +3016,13 @@ class CollectionAdapter:
                     for name, size, mtime_ns in entries
                 ]
             ),
+            "items": [
+                {"filename": name, "size_bytes": size} for name, size, _ in page["items"]
+            ],
+            "offset": page["offset"],
+            "limit": page["limit"],
+            "total": page["total"],
+            "has_more": page["has_more"],
         }
 
     def empty_media_trash(self) -> dict[str, Any]:
@@ -4149,8 +4197,8 @@ class CollectionAdapter:
             "notes_matched_first_field": len(log.first_field_match),
             "notes_found": int(log.found_notes),
             "merge_notetypes": merge_notetypes,
-            "update_notes": update_notes,
-            "update_notetypes": update_notetypes,
+            "update_notes": UPDATE_CONDITION_NAMES[update_notes],
+            "update_notetypes": UPDATE_CONDITION_NAMES[update_notetypes],
             "with_scheduling": with_scheduling,
             "with_deck_configs": with_deck_configs,
         }
