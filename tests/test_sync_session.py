@@ -57,8 +57,9 @@ async def test_status_reports_default_sync_session_state(
         await service.sync_login("user", "password", "https://sync.example.test/")
         status = await service.status()
     assert status["next_sync_required"] is None
-    assert status["sync_session_valid"] is None
-    assert status["sync_session_checked_at"] is None
+    # A successful login authenticates against the server, so the session is valid.
+    assert status["sync_session_valid"] is True
+    assert status["sync_session_checked_at"]
     assert status["last_sync_error"] is None
 
 
@@ -75,7 +76,8 @@ async def test_status_recheck_reports_a_full_sync_requirement(
         status = await service.status(recheck=True)
     assert status["next_sync_required"] == "FULL_SYNC"
     assert status["pending_full_sync"] == "FULL_SYNC"
-    assert status["sync_session_valid"] is None
+    # The local-only recheck leaves the login-established validity unchanged.
+    assert status["sync_session_valid"] is True
     assert status["sync_session_checked_at"]
     assert status["ready"] is False
     assert status["readiness_reason"] == "full_sync_required"
@@ -418,7 +420,8 @@ async def test_endpoint_switch_clears_stale_sync_requirement(
         switched = await service.status()
         assert switched["pending_full_sync"] is None
         assert switched["next_sync_required"] is None
-        assert switched["sync_session_valid"] is None
+        # The re-login authenticated against the new server, so it is valid.
+        assert switched["sync_session_valid"] is True
 
         await service.sync(sync_media=False)
         await service.sync_login("user", "password", endpoint_b)
@@ -662,3 +665,127 @@ async def test_endpoint_identity_survives_auth_invalidation(
         same_endpoint = await service.status()
     assert same_endpoint["pending_full_sync"] == "FULL_SYNC"
     assert same_endpoint["next_sync_required"] == "FULL_SYNC"
+
+
+def _write_persisted_sync_auth(collection_path: str, auth: dict[str, object]) -> None:
+    state_dir = Path(collection_path).parent / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "sync-auth").write_text(json.dumps(auth), encoding="utf-8")
+
+
+def _read_persisted_status(collection_path: str) -> dict[str, object]:
+    return json.loads(
+        (Path(collection_path).parent / "state" / "operation-status.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+
+@pytest.mark.anyio
+async def test_legacy_sidecar_seeds_endpoint_identity_from_configured_endpoint(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_login(monkeypatch)
+    monkeypatch.setattr(
+        Collection,
+        "sync_collection",
+        lambda self, auth, sync_media: SyncOutput(required=2, server_media_usn=1),
+    )
+    endpoint_a = "https://a.example.test/"
+    endpoint_b = "https://b.example.test/"
+    # A pre-upgrade sidecar: sync-auth has configured_endpoint but no username, and
+    # the status file has no last_sync_endpoint.
+    _write_persisted_sync_auth(
+        collection_path,
+        {"hkey": "legacy-key", "endpoint": "", "configured_endpoint": endpoint_a},
+    )
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        # The seeded identity means a same-endpoint re-login preserves the requirement.
+        await service.sync(sync_media=False)
+        assert (await service.status())["pending_full_sync"] == "FULL_SYNC"
+        await service.sync_login("user", "password", endpoint_a)
+        assert (await service.status())["pending_full_sync"] == "FULL_SYNC"
+
+        # A different endpoint is a switch and must clear it.
+        await service.sync_login("user", "password", endpoint_b)
+        switched = await service.status()
+    assert switched["pending_full_sync"] is None
+    assert switched["next_sync_required"] is None
+
+
+@pytest.mark.anyio
+async def test_unknown_origin_login_clears_a_pending_requirement(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_login(monkeypatch)
+    # Pending requirement with no endpoint identity at all (no sync-auth file).
+    _write_persisted_status(collection_path, {"pending_full_sync": {"required": 2}})
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        assert (await service.status())["pending_full_sync"] == "FULL_SYNC"
+        # An unknown origin cannot be proven safe, so even an AnkiWeb login clears it.
+        await service.sync_login("user", "password", None)
+        status = await service.status()
+    assert status["pending_full_sync"] is None
+    assert status["next_sync_required"] is None
+
+
+@pytest.mark.anyio
+async def test_account_switch_on_same_endpoint_clears_the_requirement(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_login(monkeypatch)
+    monkeypatch.setattr(
+        Collection,
+        "sync_collection",
+        lambda self, auth, sync_media: SyncOutput(required=2, server_media_usn=1),
+    )
+    endpoint = "https://a.example.test/"
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        await service.sync_login("user-a", "password", endpoint)
+        await service.sync(sync_media=False)
+        assert (await service.status())["pending_full_sync"] == "FULL_SYNC"
+
+        # A different account on the SAME endpoint must clear the requirement.
+        await service.sync_login("user-b", "password", endpoint)
+        switched = await service.status()
+        assert switched["pending_full_sync"] is None
+        assert switched["next_sync_required"] is None
+
+        # The SAME account on the SAME endpoint preserves it.
+        await service.sync(sync_media=False)
+        await service.sync_login("user-b", "password", endpoint)
+        same_account = await service.status()
+    assert same_account["pending_full_sync"] == "FULL_SYNC"
+    assert same_account["next_sync_required"] == "FULL_SYNC"
+
+
+@pytest.mark.anyio
+async def test_server_directed_endpoint_migration_is_recorded(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_login(monkeypatch)
+    migrated = "https://sync.ankiweb.net/"
+    monkeypatch.setattr(
+        Collection,
+        "sync_collection",
+        lambda self, auth, sync_media: SyncOutput(required=0, new_endpoint=migrated),
+    )
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        await service.sync_login("user", "password", None)
+        result = await service.sync(sync_media=False)
+        assert result["endpoint_changed"] is True
+    # The migrated endpoint is persisted as the authenticated identity, so a later
+    # re-login to the migrated URL is not treated as a switch.
+    assert _read_persisted_status(collection_path)["last_sync_endpoint"] == migrated
+
+
+@pytest.mark.anyio
+async def test_successful_login_establishes_session_validity(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_login(monkeypatch)
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        await service.sync_login("user", "password", "https://sync.example.test/")
+        status = await service.status()
+    assert status["sync_session_valid"] is True
+    assert status["sync_session_checked_at"]

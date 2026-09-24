@@ -266,9 +266,25 @@ class CollectionAdapter:
         last_sync_error = status.get("last_sync_error")
         self._last_sync_error = last_sync_error if isinstance(last_sync_error, dict) else None
         last_sync_endpoint = status.get("last_sync_endpoint")
-        self._last_sync_endpoint = (
-            last_sync_endpoint if isinstance(last_sync_endpoint, str) else None
-        )
+        if isinstance(last_sync_endpoint, str):
+            self._last_sync_endpoint = last_sync_endpoint
+        else:
+            # A sidecar written before the identity fields existed has no
+            # last_sync_endpoint; fall back to the configured endpoint so the
+            # identity is not lost (a missing identity would wrongly clear a
+            # requirement armed against a specific server).
+            configured = persisted_auth.get("configured_endpoint") if persisted_auth else None
+            self._last_sync_endpoint = (
+                configured if isinstance(configured, str) and configured else None
+            )
+        last_sync_username = status.get("last_sync_username")
+        if isinstance(last_sync_username, str):
+            self._last_sync_username = last_sync_username
+        else:
+            stored_username = persisted_auth.get("username") if persisted_auth else None
+            self._last_sync_username = (
+                stored_username if isinstance(stored_username, str) and stored_username else None
+            )
 
     def close(self) -> None:
         try:
@@ -320,6 +336,7 @@ class CollectionAdapter:
                 "sync_session_checked_at": self._sync_session_checked_at,
                 "last_sync_error": self._last_sync_error,
                 "last_sync_endpoint": self._last_sync_endpoint,
+                "last_sync_username": self._last_sync_username,
             }
         )
 
@@ -3579,32 +3596,45 @@ class CollectionAdapter:
         return {"card_ids": card_ids, "repositioned": int(changes.count)}
 
     def sync_login(self, username: str, password: str, endpoint: str | None) -> dict[str, Any]:
+        # Capture the previous identity BEFORE clearing the persisted auth.
         previous_endpoint = self._last_sync_endpoint
+        previous_username = self._last_sync_username
         self._sync_auth = None
         self._configured_sync_endpoint = None
         self._state.clear_sync_auth()
         self._save_operational_status()
         self._sync_auth = self.collection.sync_login(username, password, endpoint)
         self._configured_sync_endpoint = endpoint or None
-        if self._configured_sync_endpoint != previous_endpoint:
-            # A different endpoint may point at an unrelated server; drop stale state.
-            # Compare against the LAST server we authenticated to (which survives auth
-            # invalidation), not the in-memory configured endpoint.
+        switched = (
+            (endpoint or None) != previous_endpoint
+            or (previous_username is not None and previous_username != username)
+            or (self._pending_full_sync is not None and previous_endpoint is None)
+        )
+        if switched:
+            # A different server (or a different account on the same server) may
+            # diverge; drop any stale requirement armed against the previous identity.
+            # An UNKNOWN origin (None) is treated as a switch in the safe direction:
+            # a later sync re-arms the requirement.
             self._next_sync_required = None
             self._pending_full_sync = None
             self._last_sync_error = None
             self._sync_session_valid = None
             self._sync_session_checked_at = None
-        # Record which server we just authenticated to; only a successful login
+        # Record which identity we just authenticated to; only a successful login
         # reaches this point, so a failed login never updates it.
         self._last_sync_endpoint = endpoint or None
+        self._last_sync_username = username
         self._state.save_sync_auth(
             {
                 "hkey": self._sync_auth.hkey,
                 "endpoint": self._sync_auth.endpoint or "",
                 "configured_endpoint": self._configured_sync_endpoint or "",
+                "username": username,
             }
         )
+        # A real login authenticates against the server, unlike the local-only recheck.
+        self._sync_session_valid = True
+        self._sync_session_checked_at = datetime.now(UTC).isoformat()
         self._save_operational_status()
         return {"authenticated": True, "endpoint_kind": "custom" if endpoint else "ankiweb"}
 
@@ -3646,6 +3676,9 @@ class CollectionAdapter:
                 self._sync_auth.endpoint = validate_sync_migration_endpoint(
                     output.new_endpoint, self._configured_sync_endpoint
                 )
+                # Record the server-directed migration so a later re-login to the
+                # migrated URL is not mistaken for a switch to a different server.
+                self._last_sync_endpoint = self._sync_auth.endpoint or None
             if output.required in {2, 3, 4}:
                 self._pending_full_sync = (
                     output.required,
@@ -3666,6 +3699,7 @@ class CollectionAdapter:
                     "hkey": self._sync_auth.hkey,
                     "endpoint": self._sync_auth.endpoint or "",
                     "configured_endpoint": self._configured_sync_endpoint or "",
+                    "username": self._last_sync_username or "",
                 }
             )
             self._save_operational_status()
