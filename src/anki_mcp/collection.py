@@ -286,6 +286,11 @@ class CollectionAdapter:
         )
         status = self._state.load_status()
         self._pending_full_sync = self._parse_pending_full_sync(status.get("pending_full_sync"))
+        # Non-persisted: True only when THIS process observed the server require a
+        # full sync (a live sync response with required in {2, 3, 4}). A requirement
+        # loaded from disk or computed by the local-only recheck is informational and
+        # must never drive a destructive full sync on its own.
+        self._pending_full_sync_confirmed = False
         self._last_sync_at = status.get("last_sync_at")
         self._last_media_sync_at = status.get("last_media_sync_at")
         self._media_sync_progress = status.get("media_sync_progress")
@@ -330,6 +335,7 @@ class CollectionAdapter:
             self._last_sync_endpoint = None
             self._last_sync_username = None
             self._pending_full_sync = None
+            self._pending_full_sync_confirmed = False
             self._next_sync_required = None
             self._last_sync_error = None
             identity_consistent = False
@@ -448,6 +454,8 @@ class CollectionAdapter:
         self._next_sync_required = name
         self._sync_session_checked_at = datetime.now(UTC).isoformat()
         self._last_sync_error = None
+        # The recheck is local-only; it can never confirm a server requirement.
+        self._pending_full_sync_confirmed = False
         if required in {2, 3, 4}:
             self._pending_full_sync = (required, None)
         else:
@@ -752,6 +760,7 @@ class CollectionAdapter:
                 raise RestoreFailedError(message) from exc
         self._pending_full_sync = None
         # The collection was replaced, so any previously observed requirement is void.
+        self._pending_full_sync_confirmed = False
         self._next_sync_required = None
         self._last_sync_error = None
         self._state.mark_pending_discarded_by_restore()
@@ -3688,6 +3697,7 @@ class CollectionAdapter:
             # diverge; drop any stale requirement armed against the previous identity.
             self._next_sync_required = None
             self._pending_full_sync = None
+            self._pending_full_sync_confirmed = False
             self._last_sync_error = None
         # Record which identity we just authenticated to; only a successful login
         # reaches this point, so a failed login never updates it.
@@ -3757,8 +3767,12 @@ class CollectionAdapter:
                     output.required,
                     output.server_media_usn if sync_media else None,
                 )
+                # The live server response is the ONLY thing that confirms a
+                # requirement in this process.
+                self._pending_full_sync_confirmed = True
             else:
                 self._pending_full_sync = None
+                self._pending_full_sync_confirmed = False
             self._last_sync_at = datetime.now(UTC).isoformat()
             required = SYNC_REQUIRED_NAMES[output.required]
             self._next_sync_required = required
@@ -3809,6 +3823,12 @@ class CollectionAdapter:
         else:
             if self._pending_full_sync is None:
                 raise ValueError("a full sync was not requested by the remote server")
+            if not self._pending_full_sync_confirmed:
+                raise ValueError(
+                    "the pending full sync has not been confirmed by the server in this "
+                    "session; run anki_sync first (or anki_sync_login then anki_sync) to "
+                    "confirm what the server requires"
+                )
             required, server_usn = self._pending_full_sync
             if required == 3 and upload:
                 raise ValueError("the remote server requires a full download")
@@ -3833,6 +3853,7 @@ class CollectionAdapter:
                 self._invalidate_sync_auth()
             raise
         self._pending_full_sync = None
+        self._pending_full_sync_confirmed = False
         self._next_sync_required = None
         self._last_sync_error = None
         self._sync_session_valid = True

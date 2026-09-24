@@ -1197,3 +1197,78 @@ async def test_trailing_dot_hostname_is_still_the_same_origin(
         status = await service.status()
 
     assert status["pending_full_sync"] == "FULL_SYNC"
+
+
+@pytest.mark.anyio
+async def test_persisted_full_sync_requirement_cannot_drive_full_sync_until_confirmed(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A requirement loaded from disk cannot authorise a destructive full sync alone.
+
+    It stays visible in ``status`` but only a live server response observed in this
+    process may drive ``full_upload_or_download``.
+    """
+    endpoint = "https://sync.example.test/"
+    _write_persisted_sync_auth(
+        collection_path,
+        {
+            "hkey": "persisted-key",
+            "endpoint": endpoint,
+            "configured_endpoint": endpoint,
+            "username": "user",
+        },
+    )
+    _write_persisted_status(
+        collection_path,
+        {
+            "pending_full_sync": {"required": 2},
+            "next_sync_required": "FULL_SYNC",
+            "last_sync_endpoint": endpoint,
+            "last_sync_username": "user",
+        },
+    )
+    uploads: list[bool] = []
+    monkeypatch.setattr(Collection, "create_backup", lambda self, **kwargs: True)
+    monkeypatch.setattr(
+        Collection,
+        "full_upload_or_download",
+        lambda self, *, auth, server_usn, upload: uploads.append(upload),
+    )
+    monkeypatch.setattr(
+        Collection,
+        "sync_collection",
+        lambda self, auth, sync_media: SyncOutput(required=2, server_media_usn=1),
+    )
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        assert (await service.status())["pending_full_sync"] == "FULL_SYNC"
+        with pytest.raises(ValueError, match="not been confirmed"):
+            await service.full_sync(upload=True)
+        await service.sync(sync_media=False)
+        result = await service.full_sync(upload=True)
+    assert uploads == [True]
+    assert result["direction"] == "upload"
+
+
+@pytest.mark.anyio
+async def test_recheck_armed_requirement_does_not_authorise_full_sync(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The local-only recheck may arm a requirement but must never drive a full sync."""
+    _stub_login(monkeypatch)
+    monkeypatch.setattr(
+        Collection, "sync_status", lambda self, auth: SyncStatusResponse(required=2)
+    )
+    uploads: list[bool] = []
+    monkeypatch.setattr(Collection, "create_backup", lambda self, **kwargs: True)
+    monkeypatch.setattr(
+        Collection,
+        "full_upload_or_download",
+        lambda self, *, auth, server_usn, upload: uploads.append(upload),
+    )
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        await service.sync_login("user", "password", "https://sync.example.test/")
+        status = await service.status(recheck=True)
+        assert status["pending_full_sync"] == "FULL_SYNC"
+        with pytest.raises(ValueError, match="not been confirmed"):
+            await service.full_sync(upload=True)
+    assert uploads == []
