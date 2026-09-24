@@ -266,25 +266,27 @@ class CollectionAdapter:
         last_sync_error = status.get("last_sync_error")
         self._last_sync_error = last_sync_error if isinstance(last_sync_error, dict) else None
         last_sync_endpoint = status.get("last_sync_endpoint")
-        if isinstance(last_sync_endpoint, str):
+        configured = persisted_auth.get("configured_endpoint") if persisted_auth else None
+        # An empty string is not a known identity; treat it as unknown so a
+        # requirement armed against a real server is never wrongly preserved.
+        if isinstance(last_sync_endpoint, str) and last_sync_endpoint:
             self._last_sync_endpoint = last_sync_endpoint
-        else:
+        elif isinstance(configured, str) and configured:
             # A sidecar written before the identity fields existed has no
             # last_sync_endpoint; fall back to the configured endpoint so the
             # identity is not lost (a missing identity would wrongly clear a
             # requirement armed against a specific server).
-            configured = persisted_auth.get("configured_endpoint") if persisted_auth else None
-            self._last_sync_endpoint = (
-                configured if isinstance(configured, str) and configured else None
-            )
-        last_sync_username = status.get("last_sync_username")
-        if isinstance(last_sync_username, str):
-            self._last_sync_username = last_sync_username
+            self._last_sync_endpoint = configured
         else:
-            stored_username = persisted_auth.get("username") if persisted_auth else None
-            self._last_sync_username = (
-                stored_username if isinstance(stored_username, str) and stored_username else None
-            )
+            self._last_sync_endpoint = None
+        last_sync_username = status.get("last_sync_username")
+        stored_username = persisted_auth.get("username") if persisted_auth else None
+        if isinstance(last_sync_username, str) and last_sync_username:
+            self._last_sync_username = last_sync_username
+        elif isinstance(stored_username, str) and stored_username:
+            self._last_sync_username = stored_username
+        else:
+            self._last_sync_username = None
 
     def close(self) -> None:
         try:
@@ -3597,24 +3599,36 @@ class CollectionAdapter:
 
     def sync_login(self, username: str, password: str, endpoint: str | None) -> dict[str, Any]:
         # Capture the previous identity BEFORE clearing the persisted auth.
-        previous_endpoint = self._last_sync_endpoint
-        previous_username = self._last_sync_username
+        prev_endpoint = self._last_sync_endpoint
+        prev_username = self._last_sync_username
+        prev_configured = self._configured_sync_endpoint
         self._sync_auth = None
         self._configured_sync_endpoint = None
         self._state.clear_sync_auth()
+        # A failed login must not leave a stale valid session behind.
+        self._sync_session_valid = None
+        self._sync_session_checked_at = None
         self._save_operational_status()
         self._sync_auth = self.collection.sync_login(username, password, endpoint)
         self._configured_sync_endpoint = endpoint or None
+        new_endpoint = endpoint or None
+        # The configured endpoint still counts as the same server after a
+        # server-directed migration, so a re-login to it is not a switch.
+        endpoint_same = new_endpoint == prev_endpoint or (
+            prev_configured is not None and new_endpoint == prev_configured
+        )
         switched = (
-            (endpoint or None) != previous_endpoint
-            or (previous_username is not None and previous_username != username)
-            or (self._pending_full_sync is not None and previous_endpoint is None)
+            not endpoint_same
+            or (prev_username is not None and prev_username != username)
+            # Safety-first: when the previous ACCOUNT is unknown (a sidecar with no
+            # persisted username) and a requirement is armed, treat it as a switch.
+            # This deliberately gives up legacy same-account preservation; the
+            # requirement re-arms on the next sync/recheck, which is safe.
+            or (prev_username is None and self._pending_full_sync is not None)
         )
         if switched:
             # A different server (or a different account on the same server) may
             # diverge; drop any stale requirement armed against the previous identity.
-            # An UNKNOWN origin (None) is treated as a switch in the safe direction:
-            # a later sync re-arms the requirement.
             self._next_sync_required = None
             self._pending_full_sync = None
             self._last_sync_error = None
@@ -3622,7 +3636,7 @@ class CollectionAdapter:
             self._sync_session_checked_at = None
         # Record which identity we just authenticated to; only a successful login
         # reaches this point, so a failed login never updates it.
-        self._last_sync_endpoint = endpoint or None
+        self._last_sync_endpoint = new_endpoint
         self._last_sync_username = username
         self._state.save_sync_auth(
             {
