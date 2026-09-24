@@ -1326,16 +1326,31 @@ class CollectionAdapter:
         deck_id: int,
         state: Any,
         *,
+        selected_config_id: int,
+        configs: Sequence[Any] | None = None,
+        removed_config_ids: Sequence[int] = (),
         apply_all_parent_limits: bool | None = None,
         new_cards_ignore_review_limit: bool | None = None,
         fsrs_enabled: bool | None = None,
         fsrs_reschedule: bool = False,
     ) -> None:
+        values = (
+            [entry.config for entry in state.all_config] if configs is None else list(configs)
+        )
+        if not any(int(config.id) == selected_config_id for config in values):
+            raise ValueError(
+                f"selected deck preset {selected_config_id} is not part of the update"
+            )
+        # Rust's update_deck_configs reassigns the target deck, and every deck whose
+        # config was removed, to the LAST config in `configs` (`req.configs.last()`).
+        # Sort the intended preset last so callers cannot silently move their target.
+        values.sort(key=lambda config: int(config.id) == selected_config_id)
         try:
             self.collection.decks.update_deck_configs(
                 UpdateDeckConfigs(
                     target_deck_id=deck_id,
-                    configs=[entry.config for entry in state.all_config],
+                    configs=values,
+                    removed_config_ids=list(removed_config_ids),
                     card_state_customizer=state.card_state_customizer,
                     limits=state.current_deck.limits,
                     new_cards_ignore_review_limit=(
@@ -1395,7 +1410,8 @@ class CollectionAdapter:
                 setattr(config, field_name, value)
 
         affected_decks = int(entry.use_count)
-        self._update_deck_config_state(1, state)
+        selected = int(state.current_deck.config_id)
+        self._update_deck_config_state(1, state, selected_config_id=selected)
         return {
             "id": config_id,
             "updated": True,
@@ -1426,6 +1442,88 @@ class CollectionAdapter:
             raise ValueError("dynamic decks cannot be assigned a deck preset")
         self.collection.decks.set_config_id_for_deck_dict(deck, cast("DeckConfigId", config_id))
         return {"deck_id": deck_id, "config_id": config_id, "updated": True}
+
+    def _deck_preset_affected_decks(self, config_id: int) -> list[dict[str, Any]]:
+        deck_count = self.collection.decks.count()
+        if deck_count > self.max_search_scan:
+            raise ResourceLimitError(
+                f"deck preset {config_id}: maximum={self.max_search_scan}, "
+                f"observed={deck_count} decks; raise MCP_MAX_SEARCH_SCAN"
+            )
+        affected: list[dict[str, Any]] = []
+        for deck in sorted(self.collection.decks.all(), key=lambda item: int(item["id"])):
+            # Filtered/cram decks have no "conf" and are never reassigned.
+            if "conf" not in deck or str(deck["conf"]) != str(config_id):
+                continue
+            name, name_truncated = self._truncate_rendered(str(deck["name"]))
+            item: dict[str, Any] = {"id": int(deck["id"]), "name": name}
+            if name_truncated:
+                item["name_truncated"] = True
+            affected.append(item)
+        return affected
+
+    def preview_deck_preset_delete(self, config_id: int) -> dict[str, Any]:
+        state, entry = self._preset_entry(config_id)
+        if config_id == 1:
+            raise ValueError("the default deck preset cannot be deleted")
+        name, name_truncated = self._truncate_rendered(str(entry.config.name))
+        affected = self._deck_preset_affected_decks(config_id)
+        fallback = next(
+            (candidate for candidate in state.all_config if int(candidate.config.id) == 1),
+            None,
+        )
+        result: dict[str, Any] = {
+            "id": config_id,
+            "name": name,
+            "affected_decks": affected[: self.max_page_size],
+            "affected_decks_total": len(affected),
+            "affected_decks_truncated": len(affected) > self.max_page_size,
+            "fallback_config_id": 1,
+            "fallback_config_name": (
+                str(fallback.config.name) if fallback is not None else "Default"
+            ),
+            "backup_required": True,
+            "full_sync_required": True,
+            "state_fingerprint": self._impact_fingerprint(
+                {
+                    "config_id": config_id,
+                    "name": str(entry.config.name),
+                    "affected_deck_ids": [deck["id"] for deck in affected],
+                }
+            ),
+        }
+        if name_truncated:
+            result["name_truncated"] = True
+        return result
+
+    def delete_deck_preset(self, config_id: int) -> dict[str, Any]:
+        self._preset_entry(config_id)  # validates the preset exists
+        if config_id == 1:
+            raise ValueError("the default deck preset cannot be deleted")
+        affected = self._deck_preset_affected_decks(config_id)
+        target_id = affected[0]["id"] if affected else 1
+        state = self.collection.decks.get_deck_configs_for_update(cast("DeckId", target_id))
+        configs = [
+            entry.config for entry in state.all_config if int(entry.config.id) != config_id
+        ]
+        # Decks on the removed preset reassign to Default; a target deck not itself being
+        # deleted keeps its own preset.
+        selected = 1 if affected else int(state.current_deck.config_id)
+        self._update_deck_config_state(
+            target_id,
+            state,
+            selected_config_id=selected,
+            configs=configs,
+            removed_config_ids=[config_id],
+        )
+        return {
+            "id": config_id,
+            "deleted": True,
+            "decks_reassigned": len(affected),
+            "deck_ids": [deck["id"] for deck in affected],
+            "fallback_config_id": 1,
+            "full_sync_required": True,
+        }
 
     def update_deck_limits(
         self,
@@ -1473,7 +1571,11 @@ class CollectionAdapter:
             if scope == "today":
                 setattr(limits, f"{target}_active", False)
 
-        self._update_deck_config_state(deck_id, state)
+        self._update_deck_config_state(
+            deck_id,
+            state,
+            selected_config_id=int(state.current_deck.config_id),
+        )
         return {"deck_id": deck_id, "scope": scope, "updated": True}
 
     def update_deck_scheduler_settings(
@@ -1492,6 +1594,7 @@ class CollectionAdapter:
         self._update_deck_config_state(
             1,
             state,
+            selected_config_id=int(state.current_deck.config_id),
             apply_all_parent_limits=apply_all_parent_limits,
             new_cards_ignore_review_limit=new_cards_ignore_review_limit,
             fsrs_enabled=fsrs_enabled,
@@ -1638,7 +1741,8 @@ class CollectionAdapter:
         config = entry.config.config
         del config.fsrs_params_6[:]
         config.fsrs_params_6.extend(selected_impact["candidate_parameters"])
-        self._update_deck_config_state(1, state)
+        selected = int(state.current_deck.config_id)
+        self._update_deck_config_state(1, state, selected_config_id=selected)
         return {
             "config_id": config_id,
             "optimized": True,
@@ -2040,7 +2144,12 @@ class CollectionAdapter:
         if parameters is not None:
             del config.fsrs_params_6[:]
             config.fsrs_params_6.extend(parameters)
-        self._update_deck_config_state(1, state, fsrs_reschedule=True)
+        self._update_deck_config_state(
+            1,
+            state,
+            selected_config_id=int(state.current_deck.config_id),
+            fsrs_reschedule=True,
+        )
         return {
             "config_id": config_id,
             "rescheduled": True,
@@ -4731,6 +4840,14 @@ class AnkiCollectionService:
         return await self.executor.run(
             lambda adapter: adapter.assign_deck_preset(deck_id, config_id)
         )
+
+    async def preview_deck_preset_delete(self, config_id: int) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.preview_deck_preset_delete(config_id)
+        )
+
+    async def delete_deck_preset(self, config_id: int) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.delete_deck_preset(config_id))
 
     async def update_deck_limits(
         self,

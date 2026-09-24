@@ -448,3 +448,92 @@ async def test_review_answer_records_real_scheduling_change(
 
     assert receipt["result"] == {"id": card_id, "rating": 3, "answered": True}
     assert after["scheduling"]["reps"] == before["scheduling"]["reps"] + 1
+
+
+def test_guarded_deck_preset_deletion_requires_matching_preview_and_creates_backup(
+    phase3_settings: Settings,
+) -> None:
+    collection = Collection(str(phase3_settings.collection_path))
+    try:
+        deck_id = int(collection.decks.id("Guarded"))
+    finally:
+        collection.close()
+
+    disabled = phase3_settings.model_copy(
+        update={"allow_destructive": False, "allow_full_sync": False}
+    )
+    with TestClient(create_app(disabled)) as client:
+        headers, _ = _session(client)
+        listed = client.post(
+            "/mcp",
+            headers=headers,
+            json={"jsonrpc": "2.0", "id": 99, "method": "tools/list", "params": {}},
+        ).json()["result"]["tools"]
+    disabled_names = {tool["name"] for tool in listed}
+    assert "anki_deck_presets_delete_preview" not in disabled_names
+    assert "anki_deck_presets_delete" not in disabled_names
+
+    with TestClient(create_app(phase3_settings)) as client:
+        _, call = _session(client)
+        created_failed, created = call("anki_deck_presets_create", {"name": "Doomed"})
+        assert created_failed is False
+        config_id = created["result"]["id"]
+        assigned_failed, _ = call(
+            "anki_deck_presets_assign",
+            {
+                "deck_id": deck_id,
+                "config_id": config_id,
+                "idempotency_key": "guarded-preset-assign",
+            },
+        )
+        assert assigned_failed is False
+
+        rejected, error = call(
+            "anki_deck_presets_delete",
+            {"config_id": config_id, "confirmation_token": "not-a-preview-token"},
+        )
+        assert rejected is True
+        assert error["code"] == "DESTRUCTIVE_CONFIRMATION_REQUIRED"
+
+        failed, preview = call("anki_deck_presets_delete_preview", {"config_id": config_id})
+        assert failed is False
+        assert preview["impact"]["affected_decks_total"] == 1
+        assert preview["impact"]["affected_decks"][0]["id"] == deck_id
+        assert preview["impact"]["fallback_config_id"] == 1
+        assert preview["impact"]["full_sync_required"] is True
+        assert len(preview["impact"]["state_fingerprint"]) == 64
+
+        # The token binds the affected set, so assigning another deck makes it stale.
+        second_deck_id = int(call("anki_decks_create", {"name": "Stale"})[1]["result"]["id"])
+        call("anki_deck_presets_assign", {"deck_id": second_deck_id, "config_id": config_id})
+        stale, error = call(
+            "anki_deck_presets_delete",
+            {
+                "config_id": config_id,
+                "confirmation_token": preview["confirmation_token"],
+            },
+        )
+        assert stale is True
+        assert error["code"] == "DESTRUCTIVE_CONFIRMATION_REQUIRED"
+
+        failed, fresh = call("anki_deck_presets_delete_preview", {"config_id": config_id})
+        assert failed is False
+        failed, receipt = call(
+            "anki_deck_presets_delete",
+            {
+                "config_id": config_id,
+                "confirmation_token": fresh["confirmation_token"],
+                "idempotency_key": "guarded-preset-delete",
+            },
+        )
+        assert failed is False
+        assert receipt["result"]["deleted"] is True
+        assert receipt["result"]["decks_reassigned"] == 2
+        assert Path(receipt["result"]["backup"]["path"]).is_file()
+
+    collection = Collection(str(phase3_settings.collection_path))
+    try:
+        assert config_id not in {int(c["id"]) for c in collection.decks.all_config()}
+        assert int(collection.decks.get(deck_id)["conf"]) == 1
+    finally:
+        collection.close()

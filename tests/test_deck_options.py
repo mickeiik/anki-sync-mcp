@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 
 import pytest
 from anki.collection import Collection
+from anki.decks import DeckId
 
-from anki_mcp.collection import AnkiCollectionService
+from anki_mcp.collection import AnkiCollectionService, ResourceLimitError
 
 
 @pytest.fixture
@@ -446,3 +448,282 @@ async def test_invalid_backend_preset_patch_is_reported_as_an_argument_error(
         unchanged = await service.get_deck_preset(1, include_sections=("fsrs",))
 
     assert unchanged["sections"]["fsrs"]["fsrs_params_6"] == []
+
+
+@pytest.mark.anyio
+async def test_deck_preset_delete_preview_and_apply_reassign_decks_to_default(
+    deck_options_collection: tuple[str, int, int],
+) -> None:
+    path, _, child_id = deck_options_collection
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        created = await service.create_deck_preset("Doomed", clone_from_config_id=1)
+        await service.assign_deck_preset(child_id, created["id"])
+        scm_before = await service.executor.run(
+            lambda adapter: int(adapter.collection.db.scalar("select scm from col"))
+        )
+        preview = await service.preview_deck_preset_delete(created["id"])
+        applied = await service.delete_deck_preset(created["id"])
+        reassigned = await service.get_deck_options(child_id)
+        with pytest.raises(LookupError):
+            await service.get_deck_preset(created["id"])
+        with pytest.raises(LookupError):
+            await service.delete_deck_preset(created["id"])
+        scm_after = await service.executor.run(
+            lambda adapter: int(adapter.collection.db.scalar("select scm from col"))
+        )
+
+    assert preview["id"] == created["id"]
+    assert preview["name"] == "Doomed"
+    assert preview["affected_decks"] == [{"id": child_id, "name": "Options::Child"}]
+    assert preview["affected_decks_total"] == 1
+    assert preview["affected_decks_truncated"] is False
+    assert preview["fallback_config_id"] == 1
+    assert preview["fallback_config_name"] == "Default"
+    assert preview["backup_required"] is True
+    assert preview["full_sync_required"] is True
+    assert len(preview["state_fingerprint"]) == 64
+    assert applied == {
+        "id": created["id"],
+        "deleted": True,
+        "decks_reassigned": 1,
+        "deck_ids": [child_id],
+        "fallback_config_id": 1,
+        "full_sync_required": True,
+    }
+    assert reassigned["preset"]["id"] == 1
+    assert reassigned["preset"]["name"] == "Default"
+    assert scm_after != scm_before  # delete forces a schema change -> full sync
+
+
+@pytest.mark.anyio
+async def test_deck_preset_delete_fingerprint_tracks_affected_decks(
+    deck_options_collection: tuple[str, int, int],
+) -> None:
+    path, _, child_id = deck_options_collection
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        created = await service.create_deck_preset("Doomed", clone_from_config_id=1)
+        unassigned = await service.preview_deck_preset_delete(created["id"])
+        await service.assign_deck_preset(child_id, created["id"])
+        assigned = await service.preview_deck_preset_delete(created["id"])
+
+    assert unassigned["affected_decks_total"] == 0
+    assert assigned["affected_decks_total"] == 1
+    assert unassigned["state_fingerprint"] != assigned["state_fingerprint"]
+
+
+@pytest.mark.anyio
+async def test_deck_preset_delete_refuses_default_and_unknown_ids(
+    deck_options_collection: tuple[str, int, int],
+) -> None:
+    path, _, _ = deck_options_collection
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        with pytest.raises(ValueError, match="default deck preset cannot be deleted"):
+            await service.preview_deck_preset_delete(1)
+        with pytest.raises(ValueError, match="default deck preset cannot be deleted"):
+            await service.delete_deck_preset(1)
+        with pytest.raises(LookupError):
+            await service.preview_deck_preset_delete(4242)
+        with pytest.raises(LookupError):
+            await service.delete_deck_preset(4242)
+
+
+@pytest.mark.anyio
+async def test_unused_deck_preset_deletes_without_reassignments(
+    deck_options_collection: tuple[str, int, int],
+) -> None:
+    path, _, _ = deck_options_collection
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        created = await service.create_deck_preset("Unused", clone_from_config_id=1)
+        preview = await service.preview_deck_preset_delete(created["id"])
+        applied = await service.delete_deck_preset(created["id"])
+
+    assert preview["affected_decks"] == []
+    assert applied["decks_reassigned"] == 0
+    assert applied["deck_ids"] == []
+
+
+@pytest.mark.anyio
+async def test_update_deck_limits_keeps_target_preset_with_a_later_sorted_preset_present(
+    deck_options_collection: tuple[str, int, int],
+) -> None:
+    path, _, child_id = deck_options_collection
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        await service.create_deck_preset("Zeta", clone_from_config_id=1)
+        await service.update_deck_limits(
+            child_id,
+            scope="this_deck",
+            values={"new_cards_per_day": 5},
+            clear_fields=(),
+        )
+        preset_id = (await service.get_deck_options(child_id))["preset"]["id"]
+        applied_limit = (await service.get_deck_options(child_id))["limits"]["this_deck"][
+            "new_cards_per_day"
+        ]
+
+    assert preset_id == 1
+    assert applied_limit == 5
+
+
+@pytest.mark.anyio
+async def test_update_deck_preset_does_not_move_other_decks(
+    deck_options_collection: tuple[str, int, int],
+) -> None:
+    path, parent_id, child_id = deck_options_collection
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        zeta = await service.create_deck_preset("Zeta", clone_from_config_id=1)
+        await service.assign_deck_preset(child_id, zeta["id"])
+        await service.update_deck_preset(
+            1, name=None, options={"desired_retention": 0.85}
+        )
+        deck_one = (await service.get_deck_options(1))["preset"]["id"]
+        parent = (await service.get_deck_options(parent_id))["preset"]["id"]
+        child = (await service.get_deck_options(child_id))["preset"]["id"]
+        updated = await service.get_deck_preset(1)
+
+    assert deck_one == 1
+    assert parent == 1
+    assert child == zeta["id"]
+    assert updated["desired_retention"] == 0.85
+
+
+@pytest.mark.anyio
+async def test_update_deck_scheduler_settings_keeps_deck_presets(
+    deck_options_collection: tuple[str, int, int],
+) -> None:
+    path, _, _ = deck_options_collection
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        await service.create_deck_preset("Zeta", clone_from_config_id=1)
+        await service.update_deck_scheduler_settings(
+            apply_all_parent_limits=True,
+            new_cards_ignore_review_limit=None,
+            fsrs_enabled=None,
+        )
+        deck_one = (await service.get_deck_options(1))["preset"]["id"]
+
+    assert deck_one == 1
+
+
+@pytest.mark.anyio
+async def test_delete_unused_preset_keeps_other_decks_presets(
+    deck_options_collection: tuple[str, int, int],
+) -> None:
+    path, parent_id, _ = deck_options_collection
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        custom = await service.create_deck_preset("Custom", clone_from_config_id=1)
+        await service.assign_deck_preset(1, custom["id"])
+        doomed = await service.create_deck_preset("Doomed", clone_from_config_id=1)
+        await service.delete_deck_preset(doomed["id"])
+        deck_one = (await service.get_deck_options(1))["preset"]["id"]
+        parent = (await service.get_deck_options(parent_id))["preset"]["id"]
+
+    assert deck_one == custom["id"]
+    assert parent == 1
+
+
+@pytest.mark.anyio
+async def test_delete_shared_preset_reassigns_only_its_decks(
+    deck_options_collection: tuple[str, int, int],
+) -> None:
+    path, parent_id, child_id = deck_options_collection
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        keeper = await service.create_deck_preset("Keeper", clone_from_config_id=1)
+        await service.assign_deck_preset(1, keeper["id"])
+        shared = await service.create_deck_preset("Shared", clone_from_config_id=1)
+        await service.assign_deck_preset(parent_id, shared["id"])
+        await service.assign_deck_preset(child_id, shared["id"])
+        applied = await service.delete_deck_preset(shared["id"])
+        deck_one = (await service.get_deck_options(1))["preset"]["id"]
+        parent = (await service.get_deck_options(parent_id))["preset"]["id"]
+        child = (await service.get_deck_options(child_id))["preset"]["id"]
+
+    assert applied["decks_reassigned"] == 2
+    assert sorted(applied["deck_ids"]) == sorted([parent_id, child_id])
+    assert deck_one == keeper["id"]
+    assert parent == 1
+    assert child == 1
+
+
+@pytest.mark.anyio
+async def test_update_deck_preset_succeeds_when_decks_exceed_the_scan_bound(
+    deck_options_collection: tuple[str, int, int],
+) -> None:
+    path, _, child_id = deck_options_collection
+
+    async with AnkiCollectionService(
+        path, max_page_size=100, max_search_scan=2
+    ) as service:
+        zeta = await service.create_deck_preset("Zeta", clone_from_config_id=1)
+        await service.assign_deck_preset(child_id, zeta["id"])
+        result = await service.update_deck_preset(
+            1, name=None, options={"desired_retention": 0.85}
+        )
+        deck_one = (await service.get_deck_options(1))["preset"]["id"]
+        child = (await service.get_deck_options(child_id))["preset"]["id"]
+
+    assert result["updated"] is True
+    assert deck_one == 1
+    assert child == zeta["id"]
+
+
+@pytest.mark.anyio
+async def test_deck_preset_delete_scan_bound_raises_resource_limit_error(
+    deck_options_collection: tuple[str, int, int],
+) -> None:
+    path, _, _ = deck_options_collection
+
+    async with AnkiCollectionService(
+        path, max_page_size=100, max_search_scan=2
+    ) as service:
+        created = await service.create_deck_preset("Doomed", clone_from_config_id=1)
+        with pytest.raises(ResourceLimitError, match="MCP_MAX_SEARCH_SCAN"):
+            await service.preview_deck_preset_delete(created["id"])
+        with pytest.raises(ResourceLimitError, match="MCP_MAX_SEARCH_SCAN"):
+            await service.delete_deck_preset(created["id"])
+
+
+@pytest.mark.anyio
+async def test_deck_preset_delete_excludes_filtered_decks(
+    deck_options_collection: tuple[str, int, int],
+) -> None:
+    path, _, child_id = deck_options_collection
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        created = await service.create_deck_preset("Shared", clone_from_config_id=1)
+        await service.assign_deck_preset(child_id, created["id"])
+        await service.executor.run(
+            lambda adapter: adapter.collection.decks.new_filtered("Cram")
+        )
+        preview = await service.preview_deck_preset_delete(created["id"])
+        applied = await service.delete_deck_preset(created["id"])
+
+    assert preview["affected_decks"] == [{"id": child_id, "name": "Options::Child"}]
+    assert applied["decks_reassigned"] == 1
+    assert applied["deck_ids"] == [child_id]
+
+
+@pytest.mark.anyio
+async def test_update_deck_config_state_rejects_unknown_selected_config(
+    deck_options_collection: tuple[str, int, int],
+) -> None:
+    path, _, _ = deck_options_collection
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        with pytest.raises(ValueError, match="is not part of the update"):
+            await service.executor.run(
+                lambda adapter: adapter._update_deck_config_state(
+                    1,
+                    adapter.collection.decks.get_deck_configs_for_update(
+                        cast("DeckId", 1)
+                    ),
+                    selected_config_id=999999,
+                )
+            )

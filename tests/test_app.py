@@ -225,6 +225,8 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_deck_presets_create",
         "anki_deck_presets_update",
         "anki_deck_presets_assign",
+        "anki_deck_presets_delete_preview",
+        "anki_deck_presets_delete",
         "anki_decks_delete_preview",
         "anki_decks_delete",
         "anki_notes_search",

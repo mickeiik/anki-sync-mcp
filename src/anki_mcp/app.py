@@ -1153,6 +1153,54 @@ def create_app(settings: Settings) -> ASGIApp:
         )
 
     @scoped_tool(
+        name="anki_deck_presets_delete_preview",
+        scope="destructive",
+        enabled=(
+            settings.allow_destructive
+            and settings.allow_schema_changes
+            and settings.allow_full_sync
+        ),
+    )
+    async def deck_presets_delete_preview(config_id: StableId) -> dict[str, Any]:
+        """Preview deleting a shared deck preset; affected decks fall back to the Default preset."""
+        return await preview(
+            "anki_deck_presets_delete",
+            {"config_id": config_id},
+            lambda adapter: adapter.preview_deck_preset_delete(config_id),
+        )
+
+    @scoped_tool(
+        name="anki_deck_presets_delete",
+        scope="destructive",
+        enabled=(
+            settings.allow_destructive
+            and settings.allow_schema_changes
+            and settings.allow_full_sync
+        ),
+    )
+    async def deck_presets_delete(
+        config_id: StableId,
+        confirmation_token: ConfirmationToken,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> dict[str, Any]:
+        """Delete a shared deck preset after preview, backup, and full-sync gating.
+
+        Deletion is schema-changing, so Anki requires a full sync: the apply completes
+        after the verified backup, and the next sync demands an operator full sync.
+        Every affected deck is reassigned to the Default preset.
+        """
+        request = {"config_id": config_id}
+        return await guarded_mutate(
+            "anki_deck_presets_delete",
+            idempotency_key,
+            request,
+            confirmation_token,
+            request,
+            lambda adapter: adapter.preview_deck_preset_delete(config_id),
+            lambda adapter: adapter.delete_deck_preset(config_id),
+        )
+
+    @scoped_tool(
         name="anki_decks_delete_preview",
         scope="destructive",
         enabled=settings.allow_destructive,

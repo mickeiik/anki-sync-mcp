@@ -1002,3 +1002,43 @@ async def test_anki_26_5_native_fsrs_compatibility_smoke(
 
     assert impact["cards"] == 1
     assert applied["rescheduled"] is True
+
+
+@pytest.mark.anyio
+async def test_fsrs_optimize_keeps_deck_presets_with_a_later_sorted_preset(
+    fsrs_collection: tuple[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, _ = fsrs_collection
+    candidate = [0.2 + index / 100 for index in range(21)]
+
+    def compute_fsrs_params(self, **kwargs):  # type: ignore[no-untyped-def]
+        return scheduler_pb2.ComputeFsrsParamsResponse(
+            params=candidate, fsrs_items=10, health_check_passed=True
+        )
+
+    monkeypatch.setattr(RustBackendGenerated, "compute_fsrs_params", compute_fsrs_params)
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        await service.create_deck_preset("Zeta", None)
+        before = (await service.get_deck_options(1))["preset"]["id"]
+        await service.optimize_fsrs(1, search=None, health_check=True)
+        after = (await service.get_deck_options(1))["preset"]["id"]
+
+    assert before == 1
+    assert after == 1
+
+
+@pytest.mark.anyio
+async def test_fsrs_reschedule_keeps_deck_presets_with_a_later_sorted_preset(
+    fsrs_collection: tuple[str, int],
+) -> None:
+    path, _ = fsrs_collection
+
+    async with AnkiCollectionService(path, max_page_size=100) as service:
+        await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
+        await service.create_deck_preset("Zeta", None)
+        before = (await service.get_deck_options(1))["preset"]["id"]
+        await service.reschedule_fsrs(1, 0.91, None)
+        after = (await service.get_deck_options(1))["preset"]["id"]
+
+    assert before == 1
+    assert after == 1
