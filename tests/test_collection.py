@@ -746,7 +746,7 @@ async def test_failed_relogin_clears_previous_sync_auth(
 
 
 @pytest.mark.anyio
-async def test_failed_sync_invalidates_auth_and_bounds_remote_message(
+async def test_failed_sync_preserves_auth_and_bounds_remote_message(
     populated_collection: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     sync_attempts = 0
@@ -772,7 +772,10 @@ async def test_failed_sync_invalidates_auth_and_bounds_remote_message(
         assert result["server_message_truncated"] is True
         with pytest.raises(RuntimeError, match="failed"):
             await service.sync(sync_media=False)
-        with pytest.raises(RuntimeError, match="login"):
+        # An unexpected (non-auth, non-network) failure keeps the still-valid hkey;
+        # the next sync revalidates instead of reporting a dropped session.
+        assert (await service.status())["authenticated"] is True
+        with pytest.raises(RuntimeError, match="failed"):
             await service.sync(sync_media=False)
 
 

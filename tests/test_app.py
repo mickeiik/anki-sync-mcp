@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 from collections.abc import Iterator
 from typing import Any
 
@@ -1511,6 +1512,65 @@ def test_sync_failures_have_safe_machine_readable_codes(
     assert result["isError"] is True
     assert payload["code"] == expected_code
     assert "secret" not in payload["message"]
+
+
+def test_sync_error_logs_the_correlation_id_and_cause(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def fail_login(*args: object, **kwargs: object) -> SyncAuth:
+        raise SyncError("remote detail", None, None, None, SyncErrorKind.OTHER)
+
+    monkeypatch.setattr(Collection, "sync_login", fail_login)
+    headers = {
+        "Authorization": "Bearer correct-token",
+        "Accept": "application/json, text/event-stream",
+    }
+    initialized = client.post(
+        "/mcp",
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "pytest", "version": "1"},
+            },
+        },
+    )
+    headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+    with caplog.at_level(logging.ERROR, logger="anki_mcp.app"):
+        response = client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "anki_sync_login", "arguments": {}},
+            },
+        )
+
+    result = response.json()["result"]
+    text = result["content"][0]["text"]
+    payload = json.loads(text[text.index("{") :])
+    # The payload contract is unchanged: a content-free message and no cause.
+    assert result["isError"] is True
+    assert payload["code"] == "SYNC_ERROR"
+    assert payload["message"] == "remote sync operation failed"
+    assert "remote detail" not in text
+    # The correlation id and the concrete cause now reach the logs.
+    matching = [
+        record
+        for record in caplog.records
+        if record.name == "anki_mcp.app" and payload["correlation_id"] in record.getMessage()
+    ]
+    assert matching
+    assert matching[0].exc_info is not None
+    assert matching[0].exc_info[0] is SyncError
 
 
 @pytest.mark.parametrize(

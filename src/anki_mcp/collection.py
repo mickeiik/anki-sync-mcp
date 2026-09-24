@@ -477,6 +477,43 @@ class CollectionAdapter:
         self._save_operational_status()
         return True
 
+    def _disclose_local_sync_requirement(self) -> None:
+        """Arm the local requirement after a failed sync, with zero network calls.
+
+        Mirrors Anki's offline requirement logic (``rslib/src/sync/status.rs``) from this
+        collection's own timestamps. Do NOT replace this with ``collection.sync_status``
+        until Anki exposes an offline-only call: in anki 26.5 ``sync_status`` can issue a
+        server request when the local timestamps look clean, and a failure path must add
+        no network calls. Best-effort: any failure here must not mask the original error.
+        """
+        if self._sync_auth is None or self._pending_full_sync_confirmed:
+            return
+        try:
+            db = self.collection.db
+            if db is None:
+                return
+            scm = int(db.scalar("select scm from col") or 0)
+            mod = int(db.scalar("select mod from col") or 0)
+            ls = int(db.scalar("select ls from col") or 0)
+            # A never-synced collection (ls == 0) has a positive scm, so the
+            # comparison below reports the full sync requirement the installed Anki
+            # reports for it.
+            if scm > ls:
+                self._next_sync_required = SYNC_REQUIRED_NAMES[2]
+                self._pending_full_sync = (2, None)
+            elif mod > ls:
+                self._next_sync_required = SYNC_REQUIRED_NAMES[1]
+                self._pending_full_sync = None
+            else:
+                self._next_sync_required = SYNC_REQUIRED_NAMES[0]
+                self._pending_full_sync = None
+            # ``_pending_full_sync_confirmed`` stays untouched: only a live server
+            # response confirms a requirement in this process.
+            self._save_operational_status()
+        except Exception:
+            # The failure path must never let a local read/write mask the real cause.
+            return
+
     def status(self, recheck: bool = False) -> dict[str, Any]:
         """Report local readiness; ``recheck`` recomputes the requirement from LOCAL state.
 
@@ -1042,6 +1079,15 @@ class CollectionAdapter:
                 receipt["remote_synced"] = False
                 receipt["retryable"] = True
                 receipt["sync_error"] = self._last_sync_error
+                # Disclose the local requirement immediately; informational only and
+                # it must never drive a full sync (that needs a live confirmation).
+                # An auth rejection leaves only an unconfirmed requirement stale, so
+                # report nothing then unless a live response had confirmed one.
+                receipt["sync_required"] = (
+                    self._next_sync_required
+                    if self._sync_auth is not None or self._pending_full_sync_confirmed
+                    else None
+                )
                 self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
                 audit(receipt)
                 return receipt
@@ -3954,8 +4000,17 @@ class CollectionAdapter:
         except Exception as exc:
             kind = self._record_sync_failure(exc)
             self._sync_session_valid = False if kind == "AUTH" else None
-            if not isinstance(exc, (NetworkError, TimeoutError)):
+            if kind == "AUTH" or isinstance(exc, ValueError):
+                # Discard the persisted hkey when the server actually rejected the
+                # credential (AUTH), or on a ValueError: that is the refused
+                # server-directed endpoint migration from
+                # ``validate_sync_migration_endpoint``, and treating any unexpected
+                # ValueError the same way fails closed. Any other failure — a sync
+                # sanity-check, a 5xx, clock, conflict, interrupted, or unexpected —
+                # leaves the still-valid hkey in place; the next sync re-validates.
                 self._invalidate_sync_auth()
+            else:
+                self._disclose_local_sync_requirement()
             self._save_operational_status()
             raise
 

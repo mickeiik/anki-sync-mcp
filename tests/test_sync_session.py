@@ -12,13 +12,14 @@ from pathlib import Path
 
 import pytest
 from anki.collection import Collection
-from anki.errors import NetworkError, SyncError, SyncErrorKind
+from anki.errors import BackendError, NetworkError, SyncError, SyncErrorKind
 from anki.sync import SyncAuth, SyncOutput
 from anki.sync_pb2 import SyncStatusResponse
 
 from anki_mcp.collection import (
     SYNC_REQUIRED_NAMES,
     AnkiCollectionService,
+    CollectionAdapter,
     FullSyncRequiredError,
     SyncLoginRequiredError,
 )
@@ -234,6 +235,270 @@ async def test_post_sync_full_sync_requirement_names_the_local_commit(
     assert operation["receipt"]["sync_required"] == "FULL_SYNC"
     assert status["pending_full_sync"] == "FULL_SYNC"
     assert status["next_sync_required"] == "FULL_SYNC"
+
+
+@pytest.mark.anyio
+async def test_non_auth_sync_failure_keeps_session_and_arms_unconfirmed_full_sync(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_login(monkeypatch)
+    calls = {"count": 0}
+
+    def sync(self: Collection, auth: SyncAuth, sync_media: bool) -> SyncOutput:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            # Anki's own client code bumps the schema timestamp (scm) past the last
+            # successful sync (ls) when the end-of-sync sanity check fails.
+            self.db.execute("update col set ls = ?", int(time.time() * 1000) - 1000)
+            self.set_schema_modified()
+            raise SyncError("check database", None, None, None, SyncErrorKind.OTHER)
+        return SyncOutput(required=2)
+
+    monkeypatch.setattr(Collection, "sync_collection", sync)
+    applied = {"count": 0}
+
+    def mutate(adapter: object) -> dict[str, object]:
+        applied["count"] += 1
+        raise AssertionError("mutation applied despite a full-sync requirement")
+
+    async with AnkiCollectionService(
+        collection_path, max_page_size=100, sync_on_write=True
+    ) as service:
+        await service.sync_login("user", "password", "https://sync.example.test/")
+        with pytest.raises(SyncError):
+            await service.sync(sync_media=False)
+        status = await service.status()
+        assert status["authenticated"] is True
+        assert status["sync_session_valid"] is None
+        assert status["next_sync_required"] == "FULL_SYNC"
+        assert status["pending_full_sync"] == "FULL_SYNC"
+        assert status["ready"] is False
+        assert status["readiness_reason"] == "full_sync_required"
+        # The requirement is local-only and unconfirmed, so a full sync is refused.
+        with pytest.raises(ValueError):
+            await service.full_sync(upload=True)
+        # A live sync returning required=2 confirms it, and the write is refused
+        # before the mutation runs.
+        with pytest.raises(FullSyncRequiredError):
+            await service.coordinated_mutation(
+                operation="anki_decks_create",
+                idempotency_key="armed-full-sync-key",
+                request={"name": "Armed"},
+                mutate=mutate,
+            )
+        assert applied["count"] == 0
+
+    # The persisted hkey survived the non-auth failure.
+    async with AnkiCollectionService(collection_path, max_page_size=100) as restarted:
+        restarted_status = await restarted.status()
+    assert restarted_status["authenticated"] is True
+
+
+@pytest.mark.anyio
+async def test_non_auth_sync_failure_without_local_changes_does_not_arm(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_login(monkeypatch)
+
+    def sync(self: Collection, auth: SyncAuth, sync_media: bool) -> SyncOutput:
+        # A previously-synced collection with no local changes: ls is ahead of both
+        # scm and mod, so the offline logic derives NO_CHANGES.
+        self.db.execute("update col set ls = ?", int(time.time() * 1000) + 1000)
+        raise SyncError("check database", None, None, None, SyncErrorKind.OTHER)
+
+    monkeypatch.setattr(Collection, "sync_collection", sync)
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        await service.sync_login("user", "password", "https://sync.example.test/")
+        with pytest.raises(SyncError):
+            await service.sync(sync_media=False)
+        status = await service.status()
+    assert status["authenticated"] is True
+    assert status["next_sync_required"] == "NO_CHANGES"
+    assert status["pending_full_sync"] is None
+
+
+@pytest.mark.anyio
+async def test_never_synced_failure_discloses_full_sync(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_login(monkeypatch)
+
+    def sync(self: Collection, auth: SyncAuth, sync_media: bool) -> SyncOutput:
+        # ls == 0: the installed Anki's offline logic reports a full sync requirement
+        # for a never-synced collection, so the disclosure must not leave it stale.
+        raise SyncError("check database", None, None, None, SyncErrorKind.OTHER)
+
+    monkeypatch.setattr(Collection, "sync_collection", sync)
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        await service.sync_login("user", "password", "https://sync.example.test/")
+        with pytest.raises(SyncError):
+            await service.sync(sync_media=False)
+        status = await service.status()
+    assert status["authenticated"] is True
+    assert status["next_sync_required"] == "FULL_SYNC"
+    assert status["pending_full_sync"] == "FULL_SYNC"
+    assert status["ready"] is False
+
+
+@pytest.mark.anyio
+async def test_auth_sync_failure_still_invalidates_the_session(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_login(monkeypatch)
+
+    def sync(self: Collection, auth: SyncAuth, sync_media: bool) -> SyncOutput:
+        raise SyncError("auth rejected", None, None, None, SyncErrorKind.AUTH)
+
+    monkeypatch.setattr(Collection, "sync_collection", sync)
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        await service.sync_login("user", "password", "https://sync.example.test/")
+        with pytest.raises(SyncError):
+            await service.sync(sync_media=False)
+        status = await service.status()
+        assert status["authenticated"] is False
+        assert status["sync_session_valid"] is False
+        with pytest.raises(SyncLoginRequiredError):
+            await service.sync(sync_media=False)
+
+    async with AnkiCollectionService(collection_path, max_page_size=100) as restarted:
+        assert (await restarted.status())["authenticated"] is False
+
+
+@pytest.mark.anyio
+async def test_sync_failure_never_calls_sync_status(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_login(monkeypatch)
+    calls = {"count": 0}
+
+    def sync_status(self: Collection, auth: SyncAuth) -> SyncStatusResponse:
+        calls["count"] += 1
+        raise AssertionError("sync_status must not be called on the failure path")
+
+    def sync(self: Collection, auth: SyncAuth, sync_media: bool) -> SyncOutput:
+        self.db.execute("update col set ls = ?", int(time.time() * 1000) - 1000)
+        self.set_schema_modified()
+        raise SyncError("check database", None, None, None, SyncErrorKind.OTHER)
+
+    monkeypatch.setattr(Collection, "sync_status", sync_status)
+    monkeypatch.setattr(Collection, "sync_collection", sync)
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        await service.sync_login("user", "password", "https://sync.example.test/")
+        with pytest.raises(SyncError):
+            await service.sync(sync_media=False)
+    assert calls["count"] == 0
+
+
+@pytest.mark.anyio
+async def test_media_sync_failure_keeps_auth_and_a_confirmed_requirement(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_login(monkeypatch)
+    monkeypatch.setattr(
+        Collection,
+        "sync_collection",
+        lambda self, auth, sync_media: SyncOutput(required=2, server_media_usn=5),
+    )
+
+    def fail_media(self: CollectionAdapter) -> dict[str, object]:
+        # A backend error during the media phase, not one of the timeout-shaped media
+        # failures: the hkey is still valid and must survive.
+        raise BackendError("media sync backend failure", None, None, None)
+
+    monkeypatch.setattr(CollectionAdapter, "_wait_for_media_sync", fail_media)
+    uploaded: dict[str, object] = {"called": False, "server_usn": None}
+
+    def upload(
+        self: Collection, *, auth: SyncAuth, server_usn: int | None, upload: bool
+    ) -> None:
+        uploaded["called"] = True
+        uploaded["server_usn"] = server_usn
+
+    monkeypatch.setattr(Collection, "full_upload_or_download", upload)
+    async with AnkiCollectionService(
+        collection_path, max_page_size=100, sync_on_write=True
+    ) as service:
+        await service.sync_login("user", "password", "https://sync.example.test/")
+        with pytest.raises(BackendError):
+            await service.sync(sync_media=True)
+        status = await service.status()
+        assert status["authenticated"] is True
+        assert status["pending_full_sync"] == "FULL_SYNC"
+        result = await service.full_sync(upload=True)
+    assert result["completed"] is True
+    assert uploaded["called"] is True
+    # The live-confirmed requirement's media usn must survive the media failure.
+    assert uploaded["server_usn"] == 5
+
+
+@pytest.mark.anyio
+async def test_post_sync_failure_receipt_reports_the_local_requirement(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_login(monkeypatch)
+    calls = {"count": 0}
+
+    def sync(self: Collection, auth: SyncAuth, sync_media: bool) -> SyncOutput:
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise SyncError("post-commit sync failure", None, None, None, SyncErrorKind.OTHER)
+        return SyncOutput(required=0)
+
+    monkeypatch.setattr(Collection, "sync_collection", sync)
+    async with AnkiCollectionService(
+        collection_path, max_page_size=100, sync_on_write=True
+    ) as service:
+        await service.sync_login("user", "password", "https://sync.example.test/")
+        # Seed a last-synced timestamp equal to the schema time so the local deck
+        # mutation (which bumps mod) is the only local change.
+        scm = await service.executor.run(
+            lambda adapter: int(adapter.collection.db.scalar("select scm from col"))
+        )
+        await service.executor.run(
+            lambda adapter: adapter.collection.db.execute("update col set ls = ?", scm)
+        )
+        receipt = await service.coordinated_mutation(
+            operation="anki_decks_create",
+            idempotency_key="post-sync-requirement-key",
+            request={"name": "Requirement"},
+            mutate=lambda adapter: adapter.create_deck("Requirement"),
+        )
+    assert receipt["local_committed"] is True
+    assert receipt["remote_synced"] is False
+    assert receipt["sync_error"]["kind"] == "SYNC"
+    assert receipt["sync_required"] == "NORMAL_SYNC"
+
+
+@pytest.mark.anyio
+async def test_post_sync_auth_failure_receipt_hides_a_stale_requirement(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_login(monkeypatch)
+    calls = {"count": 0}
+
+    def sync(self: Collection, auth: SyncAuth, sync_media: bool) -> SyncOutput:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return SyncOutput(required=0)
+        raise SyncError("auth rejected", None, None, None, SyncErrorKind.AUTH)
+
+    monkeypatch.setattr(Collection, "sync_collection", sync)
+    async with AnkiCollectionService(
+        collection_path, max_page_size=100, sync_on_write=True
+    ) as service:
+        await service.sync_login("user", "password", "https://sync.example.test/")
+        receipt = await service.coordinated_mutation(
+            operation="anki_decks_create",
+            idempotency_key="post-sync-auth-key",
+            request={"name": "AuthDropped"},
+            mutate=lambda adapter: adapter.create_deck("AuthDropped"),
+        )
+    assert receipt["local_committed"] is True
+    assert receipt["remote_synced"] is False
+    assert receipt["sync_error"]["kind"] == "AUTH"
+    # The requirement was only known from the last successful sync, so an auth
+    # rejection must not report it as if it were still current.
+    assert receipt["sync_required"] is None
 
 
 def _free_loopback_port() -> int:

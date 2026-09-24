@@ -571,7 +571,7 @@ def create_app(settings: Settings) -> ASGIApp:
             raise_tool_error("NETWORK_ERROR", "remote sync network request failed", exc)
         except SyncError as exc:
             code = "AUTHENTICATION_FAILED" if exc.kind == SyncErrorKind.AUTH else "SYNC_ERROR"
-            raise_tool_error(code, "remote sync operation failed", exc)
+            raise_tool_error(code, "remote sync operation failed", exc, log_cause=True)
         except Exception as exc:
             raise_tool_error(
                 "INTERNAL_ERROR",
