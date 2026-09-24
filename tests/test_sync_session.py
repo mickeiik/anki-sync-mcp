@@ -1001,9 +1001,11 @@ async def test_origin_inconsistent_persisted_identity_is_treated_as_unknown(
         },
     )
     async with AnkiCollectionService(collection_path, max_page_size=100) as service:
-        # The mismatched identity is inconsistent, so it is treated as unknown.
+        # The mismatched identity is inconsistent: the agent distrusts BOTH the
+        # identity and the requirement, so the stale full sync cannot target the
+        # wrong server even without a re-login.
         assert await service.executor.run(lambda adapter: adapter._last_sync_endpoint) is None
-        assert (await service.status())["pending_full_sync"] == "FULL_SYNC"
+        assert (await service.status())["pending_full_sync"] is None
         await service.sync_login("user", "password", "https://a.example.test/")
         cleared = await service.status()
     assert cleared["pending_full_sync"] is None
@@ -1091,3 +1093,107 @@ async def test_failed_non_network_restore_upload_leaves_session_invalid_after_re
         status = await reopened.status()
     assert status["sync_session_valid"] is False
     assert status["authenticated"] is False
+
+
+@pytest.mark.anyio
+async def test_origin_inconsistent_persisted_pair_is_distrusted_and_disarmed(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash can pair an armed requirement with an auth for a different server."""
+    _stub_login(monkeypatch)
+    calls: list[object] = []
+
+    def record(self: Collection, *args: object, **kwargs: object) -> None:
+        calls.append(kwargs)
+
+    monkeypatch.setattr(Collection, "full_upload_or_download", record)
+    _write_persisted_sync_auth(
+        collection_path,
+        {
+            "hkey": "key-b",
+            "endpoint": "https://b.example.test/",
+            "configured_endpoint": "https://b.example.test/",
+        },
+    )
+    _write_persisted_status(
+        collection_path,
+        {
+            "pending_full_sync": {"required": 2},
+            "next_sync_required": "FULL_SYNC",
+            "last_sync_endpoint": "https://a.example.test/",
+        },
+    )
+
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        status = await service.status()
+        assert status["pending_full_sync"] is None
+        assert status["next_sync_required"] is None
+        # The stale requirement can no longer drive a wrong-remote full upload.
+        with pytest.raises(ValueError, match="full sync was not requested"):
+            await service.full_sync(upload=True)
+
+    assert calls == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("status_endpoint", "auth_endpoint"),
+    [
+        ("https://a.example.test/", ""),
+        (None, "https://b.example.test/"),
+    ],
+)
+async def test_mixed_identity_pair_is_distrusted(
+    collection_path: str,
+    monkeypatch: pytest.MonkeyPatch,
+    status_endpoint: str | None,
+    auth_endpoint: str,
+) -> None:
+    """One side custom and the other AnkiWeb/None is a crash artifact, not an identity."""
+    _stub_login(monkeypatch)
+    _write_persisted_sync_auth(
+        collection_path,
+        {"hkey": "key", "endpoint": auth_endpoint, "configured_endpoint": auth_endpoint},
+    )
+    _write_persisted_status(
+        collection_path,
+        {
+            "pending_full_sync": {"required": 4},
+            "next_sync_required": "FULL_UPLOAD",
+            "last_sync_endpoint": status_endpoint,
+        },
+    )
+
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        status = await service.status()
+
+    assert status["pending_full_sync"] is None
+    assert status["next_sync_required"] is None
+
+
+@pytest.mark.anyio
+async def test_trailing_dot_hostname_is_still_the_same_origin(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_login(monkeypatch)
+    _write_persisted_sync_auth(
+        collection_path,
+        {
+            "hkey": "key",
+            "endpoint": "https://a.example.test/",
+            "configured_endpoint": "https://a.example.test/",
+        },
+    )
+    _write_persisted_status(
+        collection_path,
+        {
+            "pending_full_sync": {"required": 2},
+            "next_sync_required": "FULL_SYNC",
+            "last_sync_endpoint": "https://a.example.test./",
+        },
+    )
+
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        status = await service.status()
+
+    assert status["pending_full_sync"] == "FULL_SYNC"

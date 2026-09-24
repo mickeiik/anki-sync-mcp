@@ -174,15 +174,17 @@ def _same_sync_origin(first: str | None, second: str | None) -> bool:
         "https",
     }:
         return False
-    if not first_parts.hostname or not second_parts.hostname:
+    first_host = (first_parts.hostname or "").casefold().rstrip(".")
+    second_host = (second_parts.hostname or "").casefold().rstrip(".")
+    if not first_host or not second_host:
         return False
     if first_port is None:
         first_port = 443 if first_parts.scheme == "https" else 80
     if second_port is None:
         second_port = 443 if second_parts.scheme == "https" else 80
-    return (first_parts.scheme, first_parts.hostname, first_port) == (
+    return (first_parts.scheme, first_host, first_port) == (
         second_parts.scheme,
-        second_parts.hostname,
+        second_host,
         second_port,
     )
 
@@ -299,34 +301,39 @@ class CollectionAdapter:
         self._sync_session_checked_at = checked_at if isinstance(checked_at, str) else None
         last_sync_error = status.get("last_sync_error")
         self._last_sync_error = last_sync_error if isinstance(last_sync_error, dict) else None
-        last_sync_endpoint = status.get("last_sync_endpoint")
+        endpoint_status = status.get("last_sync_endpoint")
         configured = persisted_auth.get("configured_endpoint") if persisted_auth else None
-        # A crash between the auth and status writes can pair an armed requirement
-        # with an auth for a DIFFERENT server. When both identity sources are present
-        # but their origins disagree, the persisted identity is inconsistent: treat it
-        # as unknown so the next login clears the requirement instead of trusting it.
-        if (
-            isinstance(last_sync_endpoint, str)
-            and last_sync_endpoint
-            and isinstance(configured, str)
-            and configured
-            and not _same_sync_origin(last_sync_endpoint, configured)
+        status_endpoint = (
+            endpoint_status if isinstance(endpoint_status, str) and endpoint_status else None
+        )
+        auth_endpoint = configured if isinstance(configured, str) and configured else None
+        if "last_sync_endpoint" not in status:
+            # A sidecar written before the identity fields existed: adopt the
+            # configured endpoint so a requirement armed against it is preserved.
+            self._last_sync_endpoint = auth_endpoint
+            identity_consistent = True
+        elif status_endpoint is None and auth_endpoint is None:
+            self._last_sync_endpoint = None  # AnkiWeb identity
+            identity_consistent = True
+        elif (
+            status_endpoint is not None
+            and auth_endpoint is not None
+            and _same_sync_origin(status_endpoint, auth_endpoint)
         ):
+            self._last_sync_endpoint = status_endpoint
+            identity_consistent = True
+        else:
+            # A crash between the auth and status writes can pair an armed requirement
+            # with an auth for a DIFFERENT server/account. Distrust BOTH the identity
+            # and the requirement so a later full sync cannot target the wrong remote;
+            # the next sync re-arms whatever the authenticated server truly needs.
             self._last_sync_endpoint = None
             self._last_sync_username = None
-        else:
-            # An empty string is not a known identity; treat it as unknown so a
-            # requirement armed against a real server is never wrongly preserved.
-            if isinstance(last_sync_endpoint, str) and last_sync_endpoint:
-                self._last_sync_endpoint = last_sync_endpoint
-            elif isinstance(configured, str) and configured:
-                # A sidecar written before the identity fields existed has no
-                # last_sync_endpoint; fall back to the configured endpoint so the
-                # identity is not lost (a missing identity would wrongly clear a
-                # requirement armed against a specific server).
-                self._last_sync_endpoint = configured
-            else:
-                self._last_sync_endpoint = None
+            self._pending_full_sync = None
+            self._next_sync_required = None
+            self._last_sync_error = None
+            identity_consistent = False
+        if identity_consistent:
             last_sync_username = status.get("last_sync_username")
             stored_username = persisted_auth.get("username") if persisted_auth else None
             if isinstance(last_sync_username, str) and last_sync_username:
