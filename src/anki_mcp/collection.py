@@ -249,12 +249,7 @@ class CollectionAdapter:
             str(persisted_auth.get("configured_endpoint") or "") or None if persisted_auth else None
         )
         status = self._state.load_status()
-        pending = status.get("pending_full_sync")
-        self._pending_full_sync = (
-            (int(pending["required"]), pending.get("server_media_usn"))
-            if isinstance(pending, dict)
-            else None
-        )
+        self._pending_full_sync = self._parse_pending_full_sync(status.get("pending_full_sync"))
         self._last_sync_at = status.get("last_sync_at")
         self._last_media_sync_at = status.get("last_media_sync_at")
         self._media_sync_progress = status.get("media_sync_progress")
@@ -270,6 +265,10 @@ class CollectionAdapter:
         self._sync_session_checked_at = checked_at if isinstance(checked_at, str) else None
         last_sync_error = status.get("last_sync_error")
         self._last_sync_error = last_sync_error if isinstance(last_sync_error, dict) else None
+        last_sync_endpoint = status.get("last_sync_endpoint")
+        self._last_sync_endpoint = (
+            last_sync_endpoint if isinstance(last_sync_endpoint, str) else None
+        )
 
     def close(self) -> None:
         try:
@@ -289,6 +288,19 @@ class CollectionAdapter:
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
+    @staticmethod
+    def _parse_pending_full_sync(pending: Any) -> tuple[int, Any] | None:
+        """Parse a persisted pending entry, treating any malformed shape as absent."""
+        try:
+            if not isinstance(pending, dict):
+                return None
+            required = pending.get("required")
+            if not isinstance(required, int) or required not in {2, 3, 4}:
+                return None
+            return (required, pending.get("server_media_usn"))
+        except Exception:  # pragma: no cover - malformed state must never block startup
+            return None
+
     def _save_operational_status(self) -> None:
         pending = None
         if self._pending_full_sync is not None:
@@ -307,6 +319,7 @@ class CollectionAdapter:
                 "sync_session_valid": self._sync_session_valid,
                 "sync_session_checked_at": self._sync_session_checked_at,
                 "last_sync_error": self._last_sync_error,
+                "last_sync_endpoint": self._last_sync_endpoint,
             }
         )
 
@@ -356,7 +369,8 @@ class CollectionAdapter:
                 self._sync_session_valid = None
                 self._save_operational_status()
             return False
-        self._sync_session_valid = True
+        # A local-only recheck cannot validate the hkey, so leave the session
+        # validity unchanged rather than reporting a bogus session as valid.
         self._next_sync_required = name
         self._sync_session_checked_at = datetime.now(UTC).isoformat()
         self._last_sync_error = None
@@ -3565,7 +3579,7 @@ class CollectionAdapter:
         return {"card_ids": card_ids, "repositioned": int(changes.count)}
 
     def sync_login(self, username: str, password: str, endpoint: str | None) -> dict[str, Any]:
-        previous_endpoint = self._configured_sync_endpoint
+        previous_endpoint = self._last_sync_endpoint
         self._sync_auth = None
         self._configured_sync_endpoint = None
         self._state.clear_sync_auth()
@@ -3574,10 +3588,16 @@ class CollectionAdapter:
         self._configured_sync_endpoint = endpoint or None
         if self._configured_sync_endpoint != previous_endpoint:
             # A different endpoint may point at an unrelated server; drop stale state.
+            # Compare against the LAST server we authenticated to (which survives auth
+            # invalidation), not the in-memory configured endpoint.
             self._next_sync_required = None
             self._pending_full_sync = None
             self._last_sync_error = None
             self._sync_session_valid = None
+            self._sync_session_checked_at = None
+        # Record which server we just authenticated to; only a successful login
+        # reaches this point, so a failed login never updates it.
+        self._last_sync_endpoint = endpoint or None
         self._state.save_sync_auth(
             {
                 "hkey": self._sync_auth.hkey,
