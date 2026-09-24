@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import socket
 import subprocess
@@ -15,7 +16,7 @@ from anki.errors import NetworkError, SyncError, SyncErrorKind
 from anki.sync import SyncAuth, SyncOutput
 from anki.sync_pb2 import SyncStatusResponse
 
-from anki_mcp.collection import AnkiCollectionService, FullSyncRequiredError
+from anki_mcp.collection import SYNC_REQUIRED_NAMES, AnkiCollectionService, FullSyncRequiredError
 
 PASSWORD = "phase1-password"
 USERNAME = "phase1-user"
@@ -61,7 +62,7 @@ async def test_status_reports_default_sync_session_state(
 
 
 @pytest.mark.anyio
-async def test_status_check_server_reports_a_full_sync_requirement(
+async def test_status_recheck_reports_a_full_sync_requirement(
     collection_path: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _stub_login(monkeypatch)
@@ -70,7 +71,7 @@ async def test_status_check_server_reports_a_full_sync_requirement(
     )
     async with AnkiCollectionService(collection_path, max_page_size=100) as service:
         await service.sync_login("user", "password", "https://sync.example.test/")
-        status = await service.status(check_server=True)
+        status = await service.status(recheck=True)
     assert status["next_sync_required"] == "FULL_SYNC"
     assert status["pending_full_sync"] == "FULL_SYNC"
     assert status["sync_session_valid"] is True
@@ -91,7 +92,7 @@ async def test_probe_network_failure_is_recorded_without_raising(
     monkeypatch.setattr(Collection, "sync_status", fail)
     async with AnkiCollectionService(collection_path, max_page_size=100) as service:
         await service.sync_login("user", "password", "https://sync.example.test/")
-        status = await service.status(check_server=True)
+        status = await service.status(recheck=True)
     assert status["sync_session_valid"] is None
     assert status["authenticated"] is True
     assert status["last_sync_error"]["kind"] == "NETWORK"
@@ -109,7 +110,7 @@ async def test_probe_auth_failure_invalidates_the_session(
     monkeypatch.setattr(Collection, "sync_status", fail)
     async with AnkiCollectionService(collection_path, max_page_size=100) as service:
         await service.sync_login("user", "password", "https://sync.example.test/")
-        status = await service.status(check_server=True)
+        status = await service.status(recheck=True)
     assert status["sync_session_valid"] is False
     assert status["authenticated"] is False
     assert status["last_sync_error"]["kind"] == "AUTH"
@@ -183,6 +184,8 @@ async def test_transient_post_sync_failure_records_a_sync_error(
         )
     assert replayed is False
     assert retried["remote_synced"] is True
+    assert retried["sync_error"] is None
+    assert retried["sync_required"] is None
 
 
 @pytest.mark.anyio
@@ -217,7 +220,7 @@ async def test_post_sync_full_sync_requirement_names_the_local_commit(
     assert "the local mutation was applied" in message
     assert "FULL_SYNC" in message
     assert "full-required-key" in message
-    assert "anki_status(check_server=true)" in message
+    assert "anki_status(recheck=true)" in message
     assert operation["receipt"]["local_committed"] is True
     assert operation["receipt"]["retryable"] is True
     assert operation["receipt"]["sync_required"] == "FULL_SYNC"
@@ -280,7 +283,11 @@ def official_sync_server(tmp_path: Path) -> Iterator[str]:
 def test_stale_client_sees_full_sync_requirement_from_official_server(
     official_sync_server: str, tmp_path: Path
 ) -> None:
-    """A client whose schema diverged from the server must be reported as blocked."""
+    """A locally-diverged client is reported blocked by the local requirement recheck.
+
+    The recheck derives the requirement from LOCAL state only; it cannot see the
+    server's divergence, which is why a local schema modification is what triggers it.
+    """
     path_a = str(tmp_path / "client-a" / "collection.anki2")
     Path(path_a).parent.mkdir()
     seed = Collection(path_a)
@@ -326,12 +333,14 @@ def test_stale_client_sees_full_sync_requirement_from_official_server(
                 await client_b.full_sync(upload=True)
 
             # The server's schema now differs from A's. Marking A's local schema
-            # modified mirrors an import/restore and exposes the divergence to the
-            # read-only requirement probe (sync_status reports local schema changes).
+            # modified mirrors an import/restore. The recheck recomputes the
+            # requirement from LOCAL state only (sync_status reports local schema
+            # changes) — it makes no network call and cannot see the server's
+            # divergence itself.
             await client_a.executor.run(
                 lambda adapter: adapter.collection.set_schema_modified()
             )
-            probed = await client_a.status(check_server=True)
+            probed = await client_a.status(recheck=True)
             assert probed["next_sync_required"] == "FULL_SYNC"
             assert probed["ready"] is False
             assert probed["readiness_reason"] == "full_sync_required"
@@ -346,3 +355,130 @@ def test_stale_client_sees_full_sync_requirement_from_official_server(
             assert (await client_a.status())["pending_mutations"] == 0
 
     asyncio.run(scenario())
+
+
+def _write_persisted_status(collection_path: str, status: dict[str, object]) -> None:
+    state_dir = Path(collection_path).parent / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "operation-status.json").write_text(json.dumps(status), encoding="utf-8")
+
+
+@pytest.mark.anyio
+async def test_persisted_full_sync_requirement_blocks_readiness(
+    collection_path: str,
+) -> None:
+    # A requirement persisted without a matching pending_full_sync must still block.
+    _write_persisted_status(collection_path, {"next_sync_required": "FULL_SYNC"})
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        status = await service.status()
+    assert status["ready"] is False
+    assert status["readiness_reason"] == "full_sync_required"
+
+
+@pytest.mark.anyio
+async def test_wrong_typed_persisted_session_state_is_dropped(
+    collection_path: str,
+) -> None:
+    _write_persisted_status(
+        collection_path,
+        {
+            "next_sync_required": 123,
+            "sync_session_valid": "yes",
+            "sync_session_checked_at": 12345,
+            "last_sync_error": "boom",
+        },
+    )
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        status = await service.status()
+    assert status["next_sync_required"] is None
+    assert status["sync_session_valid"] is None
+    assert status["sync_session_checked_at"] is None
+    assert status["last_sync_error"] is None
+
+
+@pytest.mark.anyio
+async def test_endpoint_switch_clears_stale_sync_requirement(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_login(monkeypatch)
+    monkeypatch.setattr(
+        Collection,
+        "sync_collection",
+        lambda self, auth, sync_media: SyncOutput(required=2, server_media_usn=1),
+    )
+    endpoint_a = "https://a.example.test/"
+    endpoint_b = "https://b.example.test/"
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        await service.sync_login("user", "password", endpoint_a)
+        await service.sync(sync_media=False)
+        assert (await service.status())["pending_full_sync"] == "FULL_SYNC"
+
+        await service.sync_login("user", "password", endpoint_b)
+        switched = await service.status()
+        assert switched["pending_full_sync"] is None
+        assert switched["next_sync_required"] is None
+        assert switched["sync_session_valid"] is None
+
+        await service.sync(sync_media=False)
+        await service.sync_login("user", "password", endpoint_b)
+        same_endpoint = await service.status()
+    assert same_endpoint["pending_full_sync"] == "FULL_SYNC"
+    assert same_endpoint["next_sync_required"] == "FULL_SYNC"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("required", "expected_tool"),
+    [
+        (2, "anki_sync_full_upload(confirm=true) or anki_sync_full_download(confirm=true)"),
+        (3, "anki_sync_full_download(confirm=true)"),
+        (4, "anki_sync_full_upload(confirm=true)"),
+    ],
+)
+async def test_full_sync_required_message_names_the_follow_up_tool(
+    collection_path: str,
+    monkeypatch: pytest.MonkeyPatch,
+    required: int,
+    expected_tool: str,
+) -> None:
+    _stub_login(monkeypatch)
+    calls = {"count": 0}
+
+    def sync(self: Collection, auth: SyncAuth, sync_media: bool) -> SyncOutput:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return SyncOutput(required=0)
+        return SyncOutput(required=required, server_media_usn=1)
+
+    monkeypatch.setattr(Collection, "sync_collection", sync)
+    async with AnkiCollectionService(
+        collection_path, max_page_size=100, sync_on_write=True
+    ) as service:
+        await service.sync_login("user", "password", "https://sync.example.test/")
+        with pytest.raises(FullSyncRequiredError) as failure:
+            await service.coordinated_mutation(
+                operation="anki_decks_create",
+                idempotency_key="follow-up-key",
+                request={"name": "Follow Up"},
+                mutate=lambda adapter: adapter.create_deck("Follow Up"),
+            )
+    message = str(failure.value)
+    assert SYNC_REQUIRED_NAMES[required] in message
+    assert expected_tool in message
+
+
+@pytest.mark.anyio
+async def test_failed_recheck_reports_sync_session_unverified(
+    collection_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_login(monkeypatch)
+
+    def fail(self: Collection, auth: SyncAuth) -> SyncStatusResponse:
+        raise NetworkError("server unreachable", None, None, None)
+
+    monkeypatch.setattr(Collection, "sync_status", fail)
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        await service.sync_login("user", "password", "https://sync.example.test/")
+        status = await service.status(recheck=True)
+    assert status["ready"] is False
+    assert status["readiness_reason"] == "sync_session_unverified"

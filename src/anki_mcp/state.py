@@ -194,6 +194,8 @@ class PersistentState:
                 receipt["remote_synced"] = True
                 receipt["retryable"] = receipt.get("media_synced") is False
                 receipt["state"] = "committed"
+                receipt["sync_required"] = None
+                receipt["sync_error"] = None
                 encoded = json.dumps(
                     receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")
                 )
@@ -227,6 +229,8 @@ class PersistentState:
                         "state": "committed",
                         "remote_synced": True,
                         "retryable": True,
+                        "sync_required": None,
+                        "sync_error": None,
                     }
                 )
                 changed = True
@@ -240,6 +244,8 @@ class PersistentState:
                         "remote_synced": False,
                         "retryable": False,
                         "result": None,
+                        "sync_required": None,
+                        "sync_error": None,
                     }
                 )
                 changed = True

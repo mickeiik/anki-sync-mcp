@@ -261,9 +261,13 @@ class CollectionAdapter:
         self._post_restore_upload = bool(status.get("post_restore_upload", False))
         next_required = status.get("next_sync_required")
         self._next_sync_required = next_required if isinstance(next_required, str) else None
+        if self._next_sync_required is None and self._pending_full_sync is not None:
+            # Older sidecars persisted only the pending full sync; derive the name.
+            self._next_sync_required = SYNC_REQUIRED_NAMES[self._pending_full_sync[0]]
         session_valid = status.get("sync_session_valid")
         self._sync_session_valid = session_valid if isinstance(session_valid, bool) else None
-        self._sync_session_checked_at = status.get("sync_session_checked_at")
+        checked_at = status.get("sync_session_checked_at")
+        self._sync_session_checked_at = checked_at if isinstance(checked_at, str) else None
         last_sync_error = status.get("last_sync_error")
         self._last_sync_error = last_sync_error if isinstance(last_sync_error, dict) else None
 
@@ -331,12 +335,19 @@ class CollectionAdapter:
         }
         return kind
 
-    def _probe_sync_session(self) -> None:
-        """Read-only server check that records the session state without raising."""
+    def _recheck_sync_requirement(self) -> bool:
+        """Recompute the next-write requirement from LOCAL state without a network call.
+
+        ``collection.sync_status`` is local-only: it derives the requirement from this
+        client's collection state and cannot observe server-side divergence. Returns
+        True when the requirement was determined, False when it could not be (the
+        error is recorded, never raised).
+        """
         if self._sync_auth is None:
-            return
+            return False
         try:
             required = self.collection.sync_status(self._sync_auth).required
+            name = SYNC_REQUIRED_NAMES[required]
         except Exception as exc:
             if self._record_sync_failure(exc) == "AUTH":
                 self._sync_session_valid = False
@@ -344,8 +355,7 @@ class CollectionAdapter:
             else:
                 self._sync_session_valid = None
                 self._save_operational_status()
-            return
-        name = SYNC_REQUIRED_NAMES[required]
+            return False
         self._sync_session_valid = True
         self._next_sync_required = name
         self._sync_session_checked_at = datetime.now(UTC).isoformat()
@@ -355,10 +365,17 @@ class CollectionAdapter:
         else:
             self._pending_full_sync = None
         self._save_operational_status()
+        return True
 
-    def status(self, check_server: bool = False) -> dict[str, Any]:
-        if check_server:
-            self._probe_sync_session()
+    def status(self, recheck: bool = False) -> dict[str, Any]:
+        """Report local readiness; ``recheck`` recomputes the requirement from LOCAL state.
+
+        ``recheck`` performs no network request and cannot see server-side changes. To
+        confirm the server will accept a write, call ``sync`` (which performs the
+        incremental sync and reports ``required``) or simply attempt the write — the
+        pre-sync refuses before committing.
+        """
+        recheck_determined = self._recheck_sync_requirement() if recheck else True
         collection_ready = self.check_ready()
         pending_name = (
             SYNC_REQUIRED_NAMES[self._pending_full_sync[0]]
@@ -371,13 +388,23 @@ class CollectionAdapter:
             "FULL_DOWNLOAD",
             "FULL_UPLOAD",
         }
-        ready = collection_ready and authenticated and not full_required
+        ready = (
+            collection_ready
+            and authenticated
+            and not full_required
+            and not self._post_restore_upload
+            and recheck_determined
+        )
         if not collection_ready:
             reason = "collection_unavailable"
         elif full_required:
             reason = "full_sync_required"
+        elif self._post_restore_upload:
+            reason = "post_restore_upload_pending"
         elif not authenticated:
             reason = "authentication_required"
+        elif not recheck_determined:
+            reason = "sync_session_unverified"
         else:
             reason = None
         return {
@@ -825,7 +852,10 @@ class CollectionAdapter:
                 try:
                     self._sync_or_raise_full_sync(sync_media=sync_media or media_pending)
                 except FullSyncRequiredError:
-                    receipt["retryable"] = False
+                    # Keep retryable/sync_required so replaying the key resumes the
+                    # sync once the operator resolves the full sync.
+                    receipt["retryable"] = True
+                    receipt["sync_required"] = self._next_sync_required
                     self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
                     raise
                 receipt["remote_synced"] = True
@@ -924,7 +954,7 @@ class CollectionAdapter:
             f"the local mutation was applied but the remote server requires "
             f"{requirement or 'a full synchronization'}; it is recorded under idempotency "
             f"key {idempotency_key} and will not be re-applied — run "
-            f"anki_status(check_server=true), then {action}"
+            f"anki_status(recheck=true), then {action}"
         )
 
     def _page(self, values: list[Any], offset: int, limit: int) -> dict[str, Any]:
@@ -3535,12 +3565,19 @@ class CollectionAdapter:
         return {"card_ids": card_ids, "repositioned": int(changes.count)}
 
     def sync_login(self, username: str, password: str, endpoint: str | None) -> dict[str, Any]:
+        previous_endpoint = self._configured_sync_endpoint
         self._sync_auth = None
         self._configured_sync_endpoint = None
         self._state.clear_sync_auth()
         self._save_operational_status()
         self._sync_auth = self.collection.sync_login(username, password, endpoint)
         self._configured_sync_endpoint = endpoint or None
+        if self._configured_sync_endpoint != previous_endpoint:
+            # A different endpoint may point at an unrelated server; drop stale state.
+            self._next_sync_required = None
+            self._pending_full_sync = None
+            self._last_sync_error = None
+            self._sync_session_valid = None
         self._state.save_sync_auth(
             {
                 "hkey": self._sync_auth.hkey,
@@ -3548,6 +3585,7 @@ class CollectionAdapter:
                 "configured_endpoint": self._configured_sync_endpoint or "",
             }
         )
+        self._save_operational_status()
         return {"authenticated": True, "endpoint_kind": "custom" if endpoint else "ankiweb"}
 
     def _wait_for_media_sync(self) -> dict[str, Any]:
@@ -4762,8 +4800,8 @@ class AnkiCollectionService:
             )
         )
 
-    async def status(self, check_server: bool = False) -> dict[str, Any]:
-        return await self.executor.run(lambda adapter: adapter.status(check_server))
+    async def status(self, recheck: bool = False) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.status(recheck))
 
     async def get_operation(self, idempotency_key: str) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.get_operation(idempotency_key))

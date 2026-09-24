@@ -656,13 +656,17 @@ def create_app(settings: Settings) -> ASGIApp:
         )
 
     @scoped_tool(name="anki_status", scope="read")
-    async def status(check_server: StrictBool = False) -> dict[str, Any]:
+    async def status(recheck: StrictBool = False) -> dict[str, Any]:
         """Return actionable local collection, authentication, sync, and recovery status.
 
-        check_server makes one read-only server request and may take up to the sync
-        timeout; it reports the requirement the next write would face.
+        recheck recomputes the next-write requirement from LOCAL collection state
+        (collection.sync_status) and performs NO network request; it cannot observe
+        server-side changes such as another client or a remote replace. To confirm the
+        server will accept a write, call anki_sync (which performs the incremental sync
+        and reports the ``required`` value) or simply attempt the write — the pre-sync
+        refuses before committing.
         """
-        return await execute(service.status(check_server))
+        return await execute(service.status(recheck))
 
     @scoped_tool(name="anki_operations_list", scope="read")
     async def operations_list(
