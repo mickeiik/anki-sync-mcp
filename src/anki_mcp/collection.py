@@ -108,6 +108,25 @@ UNDO_HISTORY_NOTE = (
     "Undo/redo history is held in memory for the running collection process; it is cleared by "
     "successful synchronization and is not durable across restarts or full downloads."
 )
+# Operations allowed through the FULL_SYNC gate. check_database is the remedy Anki's own
+# sync error prescribes ("Please use the Check Database function, then sync again"), and
+# empty_trash only touches local media trash which is not part of the synced collection.
+# Both change neither sync direction nor either side's synced data.
+FULL_SYNC_BYPASS_OPERATIONS = frozenset(
+    {
+        "anki_maintenance_check_database",
+        "anki_media_empty_trash",
+    }
+)
+FULL_SYNC_RECOVERY_UPLOAD = (
+    "anki_sync_full_upload(confirm=true): this collection replaces the sync copy"
+)
+FULL_SYNC_RECOVERY_DOWNLOAD = (
+    "anki_sync_full_download(confirm=true): the sync copy replaces this collection"
+)
+FULL_SYNC_RECOVERY_HINT = (
+    f"recovery: {FULL_SYNC_RECOVERY_UPLOAD}; {FULL_SYNC_RECOVERY_DOWNLOAD}"
+)
 DECK_PRESET_SECTIONS: dict[str, tuple[str, ...]] = {
     "learning": (
         "learn_steps",
@@ -575,6 +594,14 @@ class CollectionAdapter:
             "last_media_sync_at": self._last_media_sync_at,
             "media_sync_progress": self._media_sync_progress,
             "pending_mutations": self._state.pending_receipt_count(),
+            "recovery": {
+                "upload": FULL_SYNC_RECOVERY_UPLOAD,
+                "download": FULL_SYNC_RECOVERY_DOWNLOAD,
+                "requires": (
+                    "anki_sync_full_upload/download with confirm=true; requires "
+                    "ANKI_ALLOW_FULL_SYNC=true and admin scope"
+                ),
+            },
         }
 
     def get_operation(self, idempotency_key: str) -> dict[str, Any]:
@@ -947,7 +974,8 @@ class CollectionAdapter:
             return {"bootstrapped": True, **result}
         if required == "FULL_UPLOAD":
             raise FullSyncRequiredError(
-                "FULL_UPLOAD cannot be resolved by download_if_empty bootstrap"
+                "FULL_UPLOAD cannot be resolved by download_if_empty bootstrap; "
+                f"{FULL_SYNC_RECOVERY_UPLOAD}"
             )
         return {"bootstrapped": True, "direction": None, "sync": sync_result}
 
@@ -956,8 +984,9 @@ class CollectionAdapter:
         read: Callable[[CollectionAdapter], T],
         sync_before: bool,
         sync_media: bool = False,
+        operation: str | None = None,
     ) -> T:
-        if sync_before or self.sync_on_read:
+        if (sync_before or self.sync_on_read) and operation not in FULL_SYNC_BYPASS_OPERATIONS:
             self._sync_or_raise_full_sync(sync_media=sync_media)
         return read(self)
 
@@ -1024,7 +1053,25 @@ class CollectionAdapter:
                     receipt["retryable"] = True
                     receipt["sync_required"] = self._next_sync_required
                     self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
+                    if operation in FULL_SYNC_BYPASS_OPERATIONS:
+                        # A bypassable repair/cleanup replay must not refuse: the
+                        # mutation is already committed, so return the receipt.
+                        audit(receipt)
+                        return receipt
                     raise
+                except Exception:
+                    # A generic sync failure must not escape with a stale receipt:
+                    # mirror the fresh post-sync path and let the key replay later.
+                    receipt["retryable"] = True
+                    receipt["sync_error"] = self._last_sync_error
+                    receipt["sync_required"] = (
+                        self._next_sync_required
+                        if self._sync_auth is not None or self._pending_full_sync_confirmed
+                        else None
+                    )
+                    self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
+                    audit(receipt)
+                    return receipt
                 receipt["remote_synced"] = True
                 if media_pending:
                     receipt["media_synced"] = True
@@ -1035,7 +1082,8 @@ class CollectionAdapter:
             audit(receipt)
             return receipt
 
-        if sync_after and self.sync_on_write:
+        bypasses_full_sync = operation in FULL_SYNC_BYPASS_OPERATIONS
+        if sync_after and self.sync_on_write and not bypasses_full_sync:
             self._sync_or_raise_full_sync(sync_media=sync_media)
         intent: dict[str, Any] = {
             "idempotency_key": idempotency_key,
@@ -1080,6 +1128,11 @@ class CollectionAdapter:
                 receipt["retryable"] = True
                 receipt["sync_required"] = requirement
                 self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
+                if bypasses_full_sync:
+                    # The repair/cleanup committed locally; report the pending
+                    # full sync in the receipt instead of refusing.
+                    audit(receipt)
+                    return receipt
                 raise FullSyncRequiredError(
                     self._full_sync_required_receipt_message(idempotency_key, requirement)
                 ) from exc
@@ -1108,9 +1161,16 @@ class CollectionAdapter:
 
     def _sync_or_raise_full_sync(self, sync_media: bool) -> dict[str, Any]:
         result = self.sync(sync_media)
-        if result["required"] in {"FULL_SYNC", "FULL_DOWNLOAD", "FULL_UPLOAD"}:
+        required = result["required"]
+        if required in {"FULL_SYNC", "FULL_DOWNLOAD", "FULL_UPLOAD"}:
+            # Directional hint: a one-way requirement names only that remedy, so the
+            # message does not repeat the other direction's action.
+            hint = {
+                "FULL_DOWNLOAD": FULL_SYNC_RECOVERY_DOWNLOAD,
+                "FULL_UPLOAD": FULL_SYNC_RECOVERY_UPLOAD,
+            }.get(required, FULL_SYNC_RECOVERY_HINT)
             raise FullSyncRequiredError(
-                f"{result['required']} requires operator-controlled full synchronization"
+                f"{required} requires operator-controlled full synchronization; {hint}"
             )
         return result
 
@@ -1120,17 +1180,20 @@ class CollectionAdapter:
     ) -> str:
         if requirement == "FULL_DOWNLOAD":
             action = "anki_sync_full_download(confirm=true)"
+            hint = FULL_SYNC_RECOVERY_DOWNLOAD
         elif requirement == "FULL_UPLOAD":
             action = "anki_sync_full_upload(confirm=true)"
+            hint = FULL_SYNC_RECOVERY_UPLOAD
         else:
             action = (
                 "anki_sync_full_upload(confirm=true) or anki_sync_full_download(confirm=true)"
             )
+            hint = FULL_SYNC_RECOVERY_HINT
         return (
             f"the local mutation was applied but the remote server requires "
             f"{requirement or 'a full synchronization'}; it is recorded under idempotency "
             f"key {idempotency_key} and will not be re-applied — run "
-            f"anki_status(recheck=true), then {action}"
+            f"anki_status(recheck=true), then {action}; {hint}"
         )
 
     def _page(self, values: list[Any], offset: int, limit: int) -> dict[str, Any]:
@@ -1507,7 +1570,9 @@ class CollectionAdapter:
             entry.config for entry in state.all_config if int(entry.config.id) != config_id
         ]
         # Decks on the removed preset reassign to Default; a target deck not itself being
-        # deleted keeps its own preset.
+        # deleted keeps its own preset. Auto-reassign-to-Default is the accepted reading of
+        # FINDINGS' "refuse or explicit reassign": the outcome is disclosed via
+        # fallback_config_id/affected_decks and gated by the preview's state token.
         selected = 1 if affected else int(state.current_deck.config_id)
         self._update_deck_config_state(
             target_id,
@@ -5264,9 +5329,10 @@ class AnkiCollectionService:
         read: Callable[[CollectionAdapter], T],
         sync_before: bool = False,
         sync_media: bool = False,
+        operation: str | None = None,
     ) -> T:
         return await self.executor.run(
-            lambda adapter: adapter.coordinated_read(read, sync_before, sync_media)
+            lambda adapter: adapter.coordinated_read(read, sync_before, sync_media, operation)
         )
 
     async def coordinated_mutation(

@@ -604,7 +604,7 @@ def create_app(settings: Settings) -> ASGIApp:
         request: dict[str, Any],
         function: Callable[[CollectionAdapter], dict[str, Any]],
     ) -> dict[str, Any]:
-        impact = await execute(service.coordinated_read(function))
+        impact = await execute(service.coordinated_read(function, operation=operation))
         if not isinstance(impact, dict):  # pragma: no cover - previews always return mappings
             raise RuntimeError("impact preview returned an invalid result")
         return {
